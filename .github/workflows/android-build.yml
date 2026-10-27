@@ -30,18 +30,23 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 4. Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: 4. Accept Pre-Installed Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          echo "✅ Android SDK Licenses Accepted (ANDROID_HOME=$ANDROID_HOME)"
 
-      - name: 5. Setup Gradle 8.10.2 & Execute Build
+      - name: 5. Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-          arguments: assembleDebug --stacktrace
 
-      - name: 6. Upload Compiled APK Artifact
+      - name: 6. Compile Debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: 7. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FamilyVault-Sprint1-v0.1-alpha
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          
