@@ -18,7 +18,7 @@ import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
         DocumentHistoryEntity::class
     ],
     version = 1,
-    exportSchema = true
+    exportSchema = false
 )
 abstract class VaultDatabase : RoomDatabase() {
 
@@ -42,10 +42,8 @@ abstract class VaultDatabase : RoomDatabase() {
             appContext: Context,
             passphraseBytes: ByteArray
         ): VaultDatabase {
-            // Load native SQLCipher 4.6.1 C++ library
             System.loadLibrary("sqlcipher")
 
-            // Enforce 16KB encrypted database pages for Android 15/16 compatibility
             val cipherHook = object : SQLiteDatabaseHook {
                 override fun preKey(connection: SQLiteConnection) {}
                 override fun postKey(connection: SQLiteConnection) {
@@ -54,7 +52,7 @@ abstract class VaultDatabase : RoomDatabase() {
                 }
             }
 
-            // Copy key bytes so we can safely zero the caller's array after opening
+            // SupportOpenHelperFactory manages its own internal copy when clearPassphrase=false
             val keyCopy = passphraseBytes.copyOf()
             val factory = SupportOpenHelperFactory(keyCopy, cipherHook, false)
 
@@ -63,10 +61,9 @@ abstract class VaultDatabase : RoomDatabase() {
                 .addCallback(Fts5BootstrapCallback())
                 .fallbackToDestructiveMigrationOnDowngrade()
                 .build()
-                .also {
-                    // Trigger immediate connection & wipe temporary key buffer
-                    it.openHelper.writableDatabase
-                    keyCopy.fill(0)
+                .also { db ->
+                    // Force immediate SQLCipher handshake & FTS5 table creation on background thread
+                    db.openHelper.writableDatabase
                 }
         }
 
@@ -78,10 +75,6 @@ abstract class VaultDatabase : RoomDatabase() {
         }
     }
 
-    /**
-     * Automatically creates the SQLite FTS5 Virtual Table with the `trigram` tokenizer
-     * and wires up automatic sync triggers on first database creation.
-     */
     private class Fts5BootstrapCallback : Callback() {
         override fun onCreate(db: SupportSQLiteDatabase) {
             super.onCreate(db)
