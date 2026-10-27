@@ -15,8 +15,14 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Security Gate - Verify Zero Internet Permission
+      - name: 2. Audit Directory Structure & Verify Zero Internet Permission
         run: |
+          echo "=== Current Repository File Tree ==="
+          find . -maxdepth 4 -not -path '*/.*'
+          if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
+            echo "❌ ERROR: app/src/main/AndroidManifest.xml not found! Check folder paths."
+            exit 1
+          fi
           if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
             echo "❌ SECURITY VIOLATION: INTERNET permission found in AndroidManifest.xml!"
             exit 1
@@ -24,26 +30,70 @@ jobs:
             echo "✅ Zero-Network Manifest Verified."
           fi
 
-      - name: 3. Set up JDK 17
+      - name: 3. Enforce Valid Root settings.gradle.kts & build.gradle.kts
+        run: |
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FamilyVault"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          plugins {
+              id("com.android.application") version "8.7.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+              id("com.google.devtools.ksp") version "2.0.21-1.0.27" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+          echo "✅ Root Gradle configuration files verified."
+
+      - name: 4. Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 4. Accept Pre-Installed Android SDK Licenses
+      - name: 5. Accept Pre-Installed Android SDK Licenses
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
           echo "✅ Android SDK Licenses Accepted (ANDROID_HOME=$ANDROID_HOME)"
 
-      - name: 5. Install Gradle 8.10.2
+      - name: 6. Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: 6. Compile Debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: 7. Compile Debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: 7. Upload Compiled APK Artifact
+      - name: 8. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FamilyVault-Sprint1-v0.1-alpha
