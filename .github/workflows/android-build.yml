@@ -15,12 +15,35 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Audit Directory Structure & Verify Zero Internet Permission
+      - name: 2. Auto-Sanitize Hidden Spaces in Folder & File Names
         run: |
-          echo "=== Current Repository File Tree ==="
-          find . -maxdepth 4 -not -path '*/.*'
+          python3 - << 'EOF'
+          import os, shutil
+
+          # Walk bottom-up so inner files are renamed before parent directories
+          for root, dirs, files in os.walk(".", topdown=False):
+              if ".git" in root.split(os.sep):
+                  continue
+              for name in files + dirs:
+                  clean_name = name.strip()
+                  if name != clean_name:
+                      old_path = os.path.join(root, name)
+                      new_path = os.path.join(root, clean_name)
+                      print(f"Fixing whitespace in path: '{old_path}' -> '{new_path}'")
+                      if os.path.exists(new_path) and os.path.isdir(old_path):
+                          for item in os.listdir(old_path):
+                              shutil.move(os.path.join(old_path, item), os.path.join(new_path, item.strip()))
+                          os.rmdir(old_path)
+                      else:
+                          shutil.move(old_path, new_path)
+          EOF
+          echo "=== Cleaned Repository File Tree (With Exact Quotes) ==="
+          find . -maxdepth 6 -not -path '*/.*' -exec printf '"%s"\n' {} +
+
+      - name: 3. Security Gate - Verify Zero Internet Permission
+        run: |
           if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
-            echo "❌ ERROR: app/src/main/AndroidManifest.xml not found! Check folder paths."
+            echo "❌ ERROR: app/src/main/AndroidManifest.xml still missing!"
             exit 1
           fi
           if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
@@ -30,7 +53,7 @@ jobs:
             echo "✅ Zero-Network Manifest Verified."
           fi
 
-      - name: 3. Enforce Valid Root settings.gradle.kts & build.gradle.kts
+      - name: 4. Enforce Valid Root settings.gradle.kts & build.gradle.kts
         run: |
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -74,26 +97,26 @@ jobs:
           EOF
           echo "✅ Root Gradle configuration files verified."
 
-      - name: 4. Set up JDK 17
+      - name: 5. Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 5. Accept Pre-Installed Android SDK Licenses
+      - name: 6. Accept Pre-Installed Android SDK Licenses
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
           echo "✅ Android SDK Licenses Accepted (ANDROID_HOME=$ANDROID_HOME)"
 
-      - name: 6. Install Gradle 8.10.2
+      - name: 7. Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: 7. Compile Debug APK
+      - name: 8. Compile Debug APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: 8. Upload Compiled APK Artifact
+      - name: 9. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FamilyVault-Sprint1-v0.1-alpha
