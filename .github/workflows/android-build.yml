@@ -15,11 +15,13 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Ensure Android Manifest Exists & Zero-Net Protected
+      - name: 2. Auto-Generate & Verify Complete Project Structure
         run: |
-          mkdir -p app/src/main
+          mkdir -p app/src/main/java/com/familyvault/app/crypto
+          mkdir -p app/src/main/java/com/familyvault/app/data/local
+
+          # Ensure AndroidManifest.xml exists and is zero-net protected
           if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
-            echo "⚠️ AndroidManifest.xml not found in repo. Auto-generating zero-net manifest..."
             cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -47,14 +49,66 @@ jobs:
           EOF
           fi
 
+          # Ensure app/build.gradle.kts exists
+          if [ ! -f "app/build.gradle.kts" ]; then
+            cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("com.google.devtools.ksp")
+          }
+          android {
+              namespace = "com.familyvault.app"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.familyvault.app"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "0.1.0-alpha"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging {
+                  jniLibs { useLegacyPackaging = false }
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              implementation("androidx.biometric:biometric:1.1.0")
+              implementation("androidx.room:room-runtime:2.6.1")
+              implementation("androidx.room:room-ktx:2.6.1")
+              ksp("androidx.room:room-compiler:2.6.1")
+              implementation("net.zetetic:sqlcipher-android:4.6.1@aar")
+              implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+              implementation("com.google.crypto.tink:tink-android:1.15.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+              val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+              implementation(composeBom)
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+          }
+          EOF
+          fi
+
           if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
-            echo "❌ SECURITY VIOLATION: INTERNET permission found in AndroidManifest.xml!"
+            echo "❌ SECURITY VIOLATION: INTERNET permission found!"
             exit 1
           else
             echo "✅ Zero-Network Manifest Verified."
           fi
 
-      - name: 3. Enforce Robust Root Gradle Files (AGP 8.5.0)
+      - name: 3. Enforce Root Gradle Configuration (AGP 8.5.0)
         run: |
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -90,7 +144,7 @@ jobs:
           android.nonTransitiveRClass=true
           kotlin.code.style=official
           EOF
-          echo "✅ Root Gradle configuration successfully enforced."
+          echo "✅ Root Gradle configuration enforced."
 
       - name: 4. Set up JDK 17
         uses: actions/setup-java@v4
@@ -109,7 +163,7 @@ jobs:
           gradle-version: '8.10.2'
 
       - name: 7. Compile Debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: 8. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
