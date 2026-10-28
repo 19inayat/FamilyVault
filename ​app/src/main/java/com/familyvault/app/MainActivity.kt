@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.VerifiedUser
@@ -33,9 +34,10 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : FragmentActivity() {
 
-    private lateinit var cryptoManager: VaultCryptoManager
+    private var cryptoManager: VaultCryptoManager? = null
     private var unlockedDb by mutableStateOf<VaultDatabase?>(null)
-    private var authStatusMessage by mutableStateOf("Vault Locked — Biometric Verification Required")
+    private var authStatusMessage by mutableStateOf("Initializing Vault Security...")
+    private var startupError by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,33 +48,44 @@ class MainActivity : FragmentActivity() {
             WindowManager.LayoutParams.FLAG_SECURE
         )
 
-        cryptoManager = VaultCryptoManager(applicationContext)
+        try {
+            cryptoManager = VaultCryptoManager(applicationContext)
+            authStatusMessage = "Vault Locked — Biometric Verification Required"
+        } catch (e: Throwable) {
+            startupError = "Crypto Init Error:\n${e.javaClass.simpleName}: ${e.localizedMessage}\n\n${e.stackTraceToString().take(500)}"
+        }
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    val currentDb = unlockedDb
-                    if (currentDb == null) {
-                        LockedVaultScreen(
-                            statusMessage = authStatusMessage,
-                            onUnlockRequest = { triggerBiometricPrompt() }
-                        )
+                    val err = startupError
+                    if (err != null) {
+                        CrashDebugScreen(errorText = err)
                     } else {
-                        Sprint1VerifiedDashboard(
-                            db = currentDb,
-                            onLockVault = {
-                                VaultDatabase.lockAndCloseDatabase()
-                                unlockedDb = null
-                                authStatusMessage = "Vault Manually Locked & RAM Keys Scrubbed"
-                            }
-                        )
+                        val currentDb = unlockedDb
+                        if (currentDb == null) {
+                            LockedVaultScreen(
+                                statusMessage = authStatusMessage,
+                                onUnlockRequest = { triggerBiometricPrompt() }
+                            )
+                        } else {
+                            Sprint1VerifiedDashboard(
+                                db = currentDb,
+                                onLockVault = {
+                                    VaultDatabase.lockAndCloseDatabase()
+                                    unlockedDb = null
+                                    authStatusMessage = "Vault Manually Locked & RAM Keys Scrubbed"
+                                }
+                            )
+                        }
                     }
                 }
             }
         }
 
-        // Automatically trigger BiometricPrompt on launch
-        triggerBiometricPrompt()
+        if (startupError == null) {
+            triggerBiometricPrompt()
+        }
     }
 
     private fun triggerBiometricPrompt() {
@@ -80,7 +93,6 @@ class MainActivity : FragmentActivity() {
         val authenticators = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
 
         if (biometricManager.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
-            // Fallback for test devices without enrolled fingerprint/PIN
             unlockSqlCipherDatabase()
             return
         }
@@ -117,21 +129,57 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun unlockSqlCipherDatabase() {
+        val manager = cryptoManager ?: return
         lifecycleScope.launch(Dispatchers.IO) {
-            val passphraseBytes = cryptoManager.getOrCreateDatabasePassphrase()
             try {
+                val passphraseBytes = manager.getOrCreateDatabasePassphrase()
                 val db = VaultDatabase.getUnlockedInstance(applicationContext, passphraseBytes)
+                passphraseBytes.fill(0)
                 withContext(Dispatchers.Main) {
                     unlockedDb = db
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 withContext(Dispatchers.Main) {
-                    authStatusMessage = "DB Decryption Error: ${e.localizedMessage}"
+                    startupError = "Database Unlock Error:\n${e.javaClass.simpleName}: ${e.localizedMessage}\n\n${e.stackTraceToString().take(600)}"
                 }
-            } finally {
-                // Scrub raw passphrase bytes from RAM immediately
-                passphraseBytes.fill(0)
             }
+        }
+    }
+}
+
+@Composable
+private fun CrashDebugScreen(errorText: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(20.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            imageVector = Icons.Default.ErrorOutline,
+            contentDescription = "Error",
+            modifier = Modifier.size(64.dp),
+            tint = MaterialTheme.colorScheme.error
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = "App Startup Exception Caught",
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.error,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = errorText,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(12.dp),
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
         }
     }
 }
