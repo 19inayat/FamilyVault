@@ -15,8 +15,35 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Security Gate - Verify Zero Internet Permission
+      - name: 2. Auto-Sanitize Hidden Spaces in Folder & File Names
         run: |
+          python3 - << 'EOF'
+          import os, shutil
+
+          for root, dirs, files in os.walk(".", topdown=False):
+              if ".git" in root.split(os.sep):
+                  continue
+              for name in files + dirs:
+                  clean_name = name.strip()
+                  if name != clean_name:
+                      old_path = os.path.join(root, name)
+                      new_path = os.path.join(root, clean_name)
+                      print(f"Fixing whitespace: '{old_path}' -> '{new_path}'")
+                      if os.path.exists(new_path) and os.path.isdir(old_path):
+                          for item in os.listdir(old_path):
+                              shutil.move(os.path.join(old_path, item), os.path.join(new_path, item.strip()))
+                          os.rmdir(old_path)
+                      else:
+                          shutil.move(old_path, new_path)
+          EOF
+          echo "✅ Repository sanitized."
+
+      - name: 3. Security Gate - Verify Zero Internet Permission
+        run: |
+          if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
+            echo "❌ ERROR: app/src/main/AndroidManifest.xml missing!"
+            exit 1
+          fi
           if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
             echo "❌ SECURITY VIOLATION: INTERNET permission found in AndroidManifest.xml!"
             exit 1
@@ -24,28 +51,67 @@ jobs:
             echo "✅ Zero-Network Manifest Verified."
           fi
 
-      - name: 3. Set up JDK 17
+      - name: 4. Enforce Robust Root Gradle Files (AGP 8.5.0)
+        run: |
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FamilyVault"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+              id("com.google.devtools.ksp") version "2.0.21-1.0.27" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+          echo "✅ Root Gradle configuration successfully enforced."
+
+      - name: 5. Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 4. Accept Pre-Installed Android SDK Licenses
+      - name: 6. Accept Pre-Installed Android SDK Licenses
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
-          echo "✅ Android SDK Licenses Accepted (ANDROID_HOME=$ANDROID_HOME)"
+          echo "✅ Android SDK Licenses Accepted"
 
-      - name: 5. Install Gradle 8.10.2
+      - name: 7. Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: 6. Compile Debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: 8. Compile Debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: 7. Upload Compiled APK Artifact
+      - name: 9. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FamilyVault-Sprint1-v0.1-alpha
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          
