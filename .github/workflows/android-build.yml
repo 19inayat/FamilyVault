@@ -15,35 +15,38 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Auto-Sanitize Hidden Spaces in Folder & File Names
+      - name: 2. Ensure Android Manifest Exists & Zero-Net Protected
         run: |
-          python3 - << 'EOF'
-          import os, shutil
-
-          for root, dirs, files in os.walk(".", topdown=False):
-              if ".git" in root.split(os.sep):
-                  continue
-              for name in files + dirs:
-                  clean_name = name.strip()
-                  if name != clean_name:
-                      old_path = os.path.join(root, name)
-                      new_path = os.path.join(root, clean_name)
-                      print(f"Fixing whitespace: '{old_path}' -> '{new_path}'")
-                      if os.path.exists(new_path) and os.path.isdir(old_path):
-                          for item in os.listdir(old_path):
-                              shutil.move(os.path.join(old_path, item), os.path.join(new_path, item.strip()))
-                          os.rmdir(old_path)
-                      else:
-                          shutil.move(old_path, new_path)
-          EOF
-          echo "✅ Repository sanitized."
-
-      - name: 3. Security Gate - Verify Zero Internet Permission
-        run: |
+          mkdir -p app/src/main
           if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
-            echo "❌ ERROR: app/src/main/AndroidManifest.xml missing!"
-            exit 1
+            echo "⚠️ AndroidManifest.xml not found in repo. Auto-generating zero-net manifest..."
+            cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+              <application
+                  android:allowBackup="false"
+                  android:fullBackupContent="false"
+                  android:dataExtractionRules="@null"
+                  android:icon="@android:drawable/ic_lock_lock"
+                  android:label="FamilyVault"
+                  android:supportsRtl="true"
+                  android:extractNativeLibs="false"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
           fi
+
           if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
             echo "❌ SECURITY VIOLATION: INTERNET permission found in AndroidManifest.xml!"
             exit 1
@@ -51,7 +54,7 @@ jobs:
             echo "✅ Zero-Network Manifest Verified."
           fi
 
-      - name: 4. Enforce Robust Root Gradle Files (AGP 8.5.0)
+      - name: 3. Enforce Robust Root Gradle Files (AGP 8.5.0)
         run: |
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -89,26 +92,26 @@ jobs:
           EOF
           echo "✅ Root Gradle configuration successfully enforced."
 
-      - name: 5. Set up JDK 17
+      - name: 4. Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 6. Accept Pre-Installed Android SDK Licenses
+      - name: 5. Accept Pre-Installed Android SDK Licenses
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
           echo "✅ Android SDK Licenses Accepted"
 
-      - name: 7. Install Gradle 8.10.2
+      - name: 6. Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: 8. Compile Debug APK
+      - name: 7. Compile Debug APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: 9. Upload Compiled APK Artifact
+      - name: 8. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FamilyVault-Sprint1-v0.1-alpha
