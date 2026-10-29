@@ -13,6 +13,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
 
@@ -28,47 +29,63 @@ class VaultCryptoManager(context: Context) {
         AeadConfig.register()
         StreamingAeadConfig.register()
 
-        // 1. Hardware-backed AEAD for wrapping the SQLCipher 256-bit passphrase
+        val handles = try {
+            buildKeysets()
+        } catch (t: Throwable) {
+            resetCorruptedKeystore()
+            buildKeysets()
+        }
+        masterAead = handles.first
+        fileStreamingAead = handles.second
+    }
+
+    private fun buildKeysets(): Pair<Aead, StreamingAead> {
         val aeadHandle = AndroidKeysetManager.Builder()
             .withSharedPref(appContext, KEYSET_AEAD_NAME, PREFS_FILE)
             .withKeyTemplate(KeyTemplates.get("AES256_GCM"))
             .withMasterKeyUri(MASTER_KEY_URI)
             .build()
             .keysetHandle
-        masterAead = aeadHandle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
+        val aead = aeadHandle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
 
-        // 2. Hardware-backed StreamingAead (4KB chunks) for high-res scans and multi-page PDFs
         val streamHandle = AndroidKeysetManager.Builder()
             .withSharedPref(appContext, KEYSET_STREAM_NAME, PREFS_FILE)
             .withKeyTemplate(KeyTemplates.get("AES256_GCM_HKDF_4KB"))
             .withMasterKeyUri(MASTER_KEY_URI)
             .build()
             .keysetHandle
-        fileStreamingAead = streamHandle.getPrimitive(RegistryConfiguration.get(), StreamingAead::class.java)
+        val stream = streamHandle.getPrimitive(RegistryConfiguration.get(), StreamingAead::class.java)
+
+        return Pair(aead, stream)
     }
 
-    /**
-     * Retrieves or initializes the 32-byte (256-bit) SQLCipher database passphrase.
-     * Caller MUST wipe the returned ByteArray with .fill(0) after database initialization.
-     */
+    private fun resetCorruptedKeystore() {
+        prefs.edit().clear().commit()
+        try {
+            val ks = KeyStore.getInstance("AndroidKeyStore")
+            ks.load(null)
+            ks.deleteEntry("family_vault_hardware_master_key")
+        } catch (_: Throwable) {}
+    }
+
     fun getOrCreateDatabasePassphrase(): ByteArray {
         val existingCiphertextB64 = prefs.getString(ENCRYPTED_DB_PASS_KEY, null)
-        return if (existingCiphertextB64 != null) {
-            val ciphertext = Base64.decode(existingCiphertextB64, Base64.NO_WRAP)
-            masterAead.decrypt(ciphertext, DB_AAD)
-        } else {
-            val newPassphrase = ByteArray(32).also { SecureRandom().nextBytes(it) }
-            val ciphertext = masterAead.encrypt(newPassphrase, DB_AAD)
-            prefs.edit()
-                .putString(ENCRYPTED_DB_PASS_KEY, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-                .apply()
-            newPassphrase
+        if (existingCiphertextB64 != null) {
+            try {
+                val ciphertext = Base64.decode(existingCiphertextB64, Base64.NO_WRAP)
+                return masterAead.decrypt(ciphertext, DB_AAD)
+            } catch (_: Throwable) {
+                prefs.edit().remove(ENCRYPTED_DB_PASS_KEY).commit()
+            }
         }
+        val newPassphrase = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val ciphertext = masterAead.encrypt(newPassphrase, DB_AAD)
+        prefs.edit()
+            .putString(ENCRYPTED_DB_PASS_KEY, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+            .commit()
+        return newPassphrase
     }
 
-    /**
-     * Stream-encrypts any document photo or PDF into internal vault storage and computes SHA-256.
-     */
     fun encryptStreamToVaultFile(
         inputStream: InputStream,
         destinationFile: File,
@@ -88,9 +105,6 @@ class VaultCryptoManager(context: Context) {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
-    /**
-     * Opens a live decrypting stream for rendering zoomed scans or PDFs without unencrypted disk writes.
-     */
     fun openDecryptedStream(encryptedFile: File, associatedData: String): InputStream {
         val fileIn = FileInputStream(encryptedFile)
         return fileStreamingAead.newDecryptingStream(fileIn, associatedData.toByteArray())
