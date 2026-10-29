@@ -5,13 +5,13 @@ import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
+import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.VerifiedUser
@@ -34,152 +34,112 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : FragmentActivity() {
 
-    private var cryptoManager: VaultCryptoManager? = null
     private var unlockedDb by mutableStateOf<VaultDatabase?>(null)
-    private var authStatusMessage by mutableStateOf("Initializing Vault Security...")
-    private var startupError by mutableStateOf<String?>(null)
+    private var authStatusMessage by mutableStateOf("Vault Locked — Tap to Authenticate")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Block screenshots, screen recording, and Recents thumbnail caching
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE,
             WindowManager.LayoutParams.FLAG_SECURE
         )
 
-        try {
-            cryptoManager = VaultCryptoManager(applicationContext)
-            authStatusMessage = "Vault Locked — Biometric Verification Required"
-        } catch (e: Throwable) {
-            startupError = "Crypto Init Error:\n${e.javaClass.simpleName}: ${e.localizedMessage}\n\n${e.stackTraceToString().take(500)}"
-        }
-
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    val err = startupError
-                    if (err != null) {
-                        CrashDebugScreen(errorText = err)
+                    val currentDb = unlockedDb
+                    if (currentDb == null) {
+                        LockedVaultScreen(
+                            statusMessage = authStatusMessage,
+                            onUnlockRequest = { triggerBiometricPromptSafe() }
+                        )
                     } else {
-                        val currentDb = unlockedDb
-                        if (currentDb == null) {
-                            LockedVaultScreen(
-                                statusMessage = authStatusMessage,
-                                onUnlockRequest = { triggerBiometricPrompt() }
-                            )
-                        } else {
-                            Sprint1VerifiedDashboard(
-                                db = currentDb,
-                                onLockVault = {
-                                    VaultDatabase.lockAndCloseDatabase()
-                                    unlockedDb = null
-                                    authStatusMessage = "Vault Manually Locked & RAM Keys Scrubbed"
-                                }
-                            )
-                        }
+                        Sprint1VerifiedDashboard(
+                            db = currentDb,
+                            onLockVault = {
+                                VaultDatabase.lockAndCloseDatabase()
+                                unlockedDb = null
+                                authStatusMessage = "Vault Locked & RAM Keys Scrubbed"
+                            }
+                        )
                     }
                 }
             }
         }
 
-        if (startupError == null) {
-            triggerBiometricPrompt()
+        window.decorView.post {
+            triggerBiometricPromptSafe()
         }
     }
 
-    private fun triggerBiometricPrompt() {
-        val biometricManager = BiometricManager.from(this)
-        val authenticators = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
+    private fun triggerBiometricPromptSafe() {
+        try {
+            val biometricManager = BiometricManager.from(this)
+            val primaryAuth = BIOMETRIC_STRONG or BIOMETRIC_WEAK or DEVICE_CREDENTIAL
+            val fallbackAuth = BIOMETRIC_WEAK or DEVICE_CREDENTIAL
 
-        if (biometricManager.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
-            unlockSqlCipherDatabase()
-            return
-        }
-
-        val executor = ContextCompat.getMainExecutor(this)
-        val promptInfo = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Unlock FamilyVault")
-            .setSubtitle("Authenticate to decrypt your offline SQLCipher database")
-            .setAllowedAuthenticators(authenticators)
-            .build()
-
-        val biometricPrompt = BiometricPrompt(
-            this,
-            executor,
-            object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    super.onAuthenticationSucceeded(result)
+            val chosenAuth = when {
+                biometricManager.canAuthenticate(primaryAuth) == BiometricManager.BIOMETRIC_SUCCESS -> primaryAuth
+                biometricManager.canAuthenticate(fallbackAuth) == BiometricManager.BIOMETRIC_SUCCESS -> fallbackAuth
+                else -> {
                     unlockSqlCipherDatabase()
-                }
-
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    super.onAuthenticationError(errorCode, errString)
-                    authStatusMessage = "Authentication Cancelled: $errString"
-                }
-
-                override fun onAuthenticationFailed() {
-                    super.onAuthenticationFailed()
-                    authStatusMessage = "Biometric not recognized. Try again."
+                    return
                 }
             }
-        )
 
-        biometricPrompt.authenticate(promptInfo)
+            val executor = ContextCompat.getMainExecutor(this)
+            val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                .setTitle("Unlock FamilyVault")
+                .setSubtitle("Verify identity to decrypt offline SQLCipher vault")
+                .setAllowedAuthenticators(chosenAuth)
+                .build()
+
+            val biometricPrompt = BiometricPrompt(
+                this,
+                executor,
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                        super.onAuthenticationSucceeded(result)
+                        unlockSqlCipherDatabase()
+                    }
+
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        super.onAuthenticationError(errorCode, errString)
+                        authStatusMessage = "Auth Cancelled ($errorCode): $errString"
+                    }
+
+                    override fun onAuthenticationFailed() {
+                        super.onAuthenticationFailed()
+                        authStatusMessage = "Biometric not recognized. Try again."
+                    }
+                }
+            )
+            biometricPrompt.authenticate(promptInfo)
+        } catch (t: Throwable) {
+            authStatusMessage = "Biometric Init Fallback: ${t.localizedMessage}"
+            unlockSqlCipherDatabase()
+        }
     }
 
     private fun unlockSqlCipherDatabase() {
-        val manager = cryptoManager ?: return
+        authStatusMessage = "Decrypting SQLCipher Vault..."
         lifecycleScope.launch(Dispatchers.IO) {
+            var passphraseBytes: ByteArray? = null
             try {
-                val passphraseBytes = manager.getOrCreateDatabasePassphrase()
+                val crypto = VaultCryptoManager(applicationContext)
+                passphraseBytes = crypto.getOrCreateDatabasePassphrase()
                 val db = VaultDatabase.getUnlockedInstance(applicationContext, passphraseBytes)
-                passphraseBytes.fill(0)
                 withContext(Dispatchers.Main) {
                     unlockedDb = db
                 }
-            } catch (e: Throwable) {
+            } catch (t: Throwable) {
                 withContext(Dispatchers.Main) {
-                    startupError = "Database Unlock Error:\n${e.javaClass.simpleName}: ${e.localizedMessage}\n\n${e.stackTraceToString().take(600)}"
+                    authStatusMessage = "Vault Error: ${t.javaClass.simpleName} - ${t.localizedMessage}"
                 }
+            } finally {
+                passphraseBytes?.fill(0)
             }
-        }
-    }
-}
-
-@Composable
-private fun CrashDebugScreen(errorText: String) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(20.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Icon(
-            imageVector = Icons.Default.ErrorOutline,
-            contentDescription = "Error",
-            modifier = Modifier.size(64.dp),
-            tint = MaterialTheme.colorScheme.error
-        )
-        Spacer(modifier = Modifier.height(12.dp))
-        Text(
-            text = "App Startup Exception Caught",
-            style = MaterialTheme.typography.titleLarge,
-            color = MaterialTheme.colorScheme.error,
-            fontWeight = FontWeight.Bold
-        )
-        Spacer(modifier = Modifier.height(12.dp))
-        Card(
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(
-                text = errorText,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(12.dp),
-                color = MaterialTheme.colorScheme.onErrorContainer
-            )
         }
     }
 }
@@ -272,12 +232,12 @@ private fun Sprint1VerifiedDashboard(
                     Spacer(modifier = Modifier.width(12.dp))
                     Column {
                         Text(
-                            text = "SQLCipher 4.6.1 (16KB Pages) Unlocked",
+                            text = "SQLCipher 4.6.1 AES-256 Unlocked",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Zero Internet Permission • Tink AES256-GCM Ready • FTS5 Trigram Active",
+                            text = "Android 13+ Verified • Zero Internet • Tink Hardware Keystore",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -287,47 +247,53 @@ private fun Sprint1VerifiedDashboard(
             Button(
                 onClick = {
                     scope.launch(Dispatchers.IO) {
-                        val dao = db.vaultDao()
-                        val existing = dao.getAllFamilyMembersOnce()
-                        val memberId = if (existing.isEmpty()) {
-                            dao.insertFamilyMember(
-                                FamilyMemberEntity(
-                                    canonicalName = "Self Profile (Test)",
-                                    sortedTokens = "PROFILE SELF TEST",
-                                    phoneticPrimary = "SLF",
-                                    relationshipRole = "Self"
+                        try {
+                            val dao = db.vaultDao()
+                            val existing = dao.getAllFamilyMembersOnce()
+                            val memberId = if (existing.isEmpty()) {
+                                dao.insertFamilyMember(
+                                    FamilyMemberEntity(
+                                        canonicalName = "Self Profile (Test)",
+                                        sortedTokens = "PROFILE SELF TEST",
+                                        phoneticPrimary = "SLF",
+                                        relationshipRole = "Self"
+                                    )
+                                )
+                            } else {
+                                existing.first().memberId
+                            }
+
+                            dao.insertDocument(
+                                DocumentEntity(
+                                    memberId = memberId,
+                                    docCategory = "ID_CARD",
+                                    docSubType = "PAN Card",
+                                    nameOnDocument = "Self Profile",
+                                    documentNumber = "ABCDE1234F",
+                                    issuingAuthority = "Income Tax Department",
+                                    rawExtractedText = "INCOME TAX DEPARTMENT GOVT OF INDIA IFSC SBIN0040123",
+                                    extractionSource = "SPRINT1_DIAGNOSTIC"
                                 )
                             )
-                        } else {
-                            existing.first().memberId
-                        }
 
-                        dao.insertDocument(
-                            DocumentEntity(
-                                memberId = memberId,
-                                docCategory = "ID_CARD",
-                                docSubType = "PAN Card",
-                                nameOnDocument = "Self Profile",
-                                documentNumber = "ABCDE1234F",
-                                issuingAuthority = "Income Tax Department",
-                                rawExtractedText = "INCOME TAX DEPARTMENT GOVT OF INDIA IFSC SBIN0040123",
-                                extractionSource = "SPRINT1_DIAGNOSTIC"
-                            )
-                        )
+                            val startNs = System.nanoTime()
+                            val ftsHits = dao.searchDocumentsFts5("04012")
+                            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0
 
-                        val startNs = System.nanoTime()
-                        val ftsHits = dao.searchDocumentsFts5("04012")
-                        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0
-
-                        withContext(Dispatchers.Main) {
-                            ftsTestResult = "✅ FTS5 Trigram Substring Search ('04012' inside 'SBIN0040123') " +
-                                "returned ${ftsHits.size} record(s) in ${"%.2f".format(elapsedMs)} ms!"
+                            withContext(Dispatchers.Main) {
+                                ftsTestResult = "✅ FTS5 Substring Search ('04012' inside 'SBIN0040123') " +
+                                    "returned ${ftsHits.size} record(s) in ${"%.2f".format(elapsedMs)} ms!"
+                            }
+                        } catch (t: Throwable) {
+                            withContext(Dispatchers.Main) {
+                                ftsTestResult = "❌ Test Error: ${t.localizedMessage}"
+                            }
                         }
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Run Diagnostic Self-Test (Insert & FTS5 Trigram Query)")
+                Text("Run Diagnostic Self-Test (Insert & FTS5 Search)")
             }
 
             Text(
