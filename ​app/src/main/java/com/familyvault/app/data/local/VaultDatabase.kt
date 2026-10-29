@@ -5,8 +5,6 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
-import net.zetetic.database.sqlcipher.SQLiteConnection
-import net.zetetic.database.sqlcipher.SQLiteDatabaseHook
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 
 @Database(
@@ -44,17 +42,8 @@ abstract class VaultDatabase : RoomDatabase() {
         ): VaultDatabase {
             System.loadLibrary("sqlcipher")
 
-            val cipherHook = object : SQLiteDatabaseHook {
-                override fun preKey(connection: SQLiteConnection) {}
-                override fun postKey(connection: SQLiteConnection) {
-                    connection.execute("PRAGMA cipher_page_size = 16384;", null, null)
-                    connection.execute("PRAGMA foreign_keys = ON;", null, null)
-                }
-            }
-
-            // SupportOpenHelperFactory manages its own internal copy when clearPassphrase=false
             val keyCopy = passphraseBytes.copyOf()
-            val factory = SupportOpenHelperFactory(keyCopy, cipherHook, false)
+            val factory = SupportOpenHelperFactory(keyCopy)
 
             return Room.databaseBuilder(appContext, VaultDatabase::class.java, DB_NAME)
                 .openHelperFactory(factory)
@@ -62,7 +51,6 @@ abstract class VaultDatabase : RoomDatabase() {
                 .fallbackToDestructiveMigrationOnDowngrade()
                 .build()
                 .also { db ->
-                    // Force immediate SQLCipher handshake & FTS5 table creation on background thread
                     db.openHelper.writableDatabase
                 }
         }
@@ -78,21 +66,36 @@ abstract class VaultDatabase : RoomDatabase() {
     private class Fts5BootstrapCallback : Callback() {
         override fun onCreate(db: SupportSQLiteDatabase) {
             super.onCreate(db)
-
-            db.execSQL(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-                    name_on_document,
-                    document_number,
-                    issuing_authority,
-                    extra_attributes_json,
-                    raw_extracted_text,
-                    content='documents',
-                    content_rowid='doc_id',
-                    tokenize='trigram'
-                );
-                """.trimIndent()
-            )
+            try {
+                db.execSQL(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+                        name_on_document,
+                        document_number,
+                        issuing_authority,
+                        extra_attributes_json,
+                        raw_extracted_text,
+                        content='documents',
+                        content_rowid='doc_id',
+                        tokenize='trigram'
+                    );
+                    """.trimIndent()
+                )
+            } catch (_: Throwable) {
+                db.execSQL(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+                        name_on_document,
+                        document_number,
+                        issuing_authority,
+                        extra_attributes_json,
+                        raw_extracted_text,
+                        content='documents',
+                        content_rowid='doc_id'
+                    );
+                    """.trimIndent()
+                )
+            }
 
             db.execSQL(
                 """
