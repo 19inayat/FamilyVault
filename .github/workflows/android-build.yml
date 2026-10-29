@@ -15,100 +15,79 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Auto-Generate & Verify Complete Project Structure
+      - name: 2. Rescue .kt Files from Spaced Folders & Normalize Paths
         run: |
-          mkdir -p app/src/main/java/com/familyvault/app/crypto
-          mkdir -p app/src/main/java/com/familyvault/app/data/local
+          python3 - << 'EOF'
+          import os, shutil
 
-          # Ensure AndroidManifest.xml exists and is zero-net protected
-          if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
-            cat << 'EOF' > app/src/main/AndroidManifest.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
-              <application
-                  android:allowBackup="false"
-                  android:fullBackupContent="false"
-                  android:dataExtractionRules="@null"
-                  android:icon="@android:drawable/ic_lock_lock"
-                  android:label="FamilyVault"
-                  android:supportsRtl="true"
-                  android:extractNativeLibs="false"
-                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:windowSoftInputMode="adjustResize">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
+          # Map every expected Kotlin file to its exact clean destination path
+          target_files = {
+              "MainActivity.kt": "app/src/main/java/com/familyvault/app/MainActivity.kt",
+              "VaultCryptoManager.kt": "app/src/main/java/com/familyvault/app/crypto/VaultCryptoManager.kt",
+              "Entities.kt": "app/src/main/java/com/familyvault/app/data/local/Entities.kt",
+              "VaultDao.kt": "app/src/main/java/com/familyvault/app/data/local/VaultDao.kt",
+              "VaultDatabase.kt": "app/src/main/java/com/familyvault/app/data/local/VaultDatabase.kt",
+              "AndroidManifest.xml": "app/src/main/AndroidManifest.xml",
+              "build.gradle.kts": "app/build.gradle.kts"
+          }
+
+          rescued_contents = {}
+
+          # Search entire repo (even inside folders with hidden spaces)
+          for root, dirs, files in os.walk("."):
+              if ".git" in root.split(os.sep):
+                  continue
+              for f in files:
+                  clean_f = f.strip()
+                  full_path = os.path.join(root, f)
+                  # Avoid picking root build.gradle.kts as app/build.gradle.kts
+                  if clean_f == "build.gradle.kts" and os.path.normpath(root) == ".":
+                      continue
+                  if clean_f in target_files:
+                      with open(full_path, "rb") as fp:
+                          data = fp.read()
+                      if len(data) > 50:
+                          rescued_contents[clean_f] = data
+                          print(f"Found '{clean_f}' at '{full_path}' ({len(data)} bytes)")
+
+          # Remove any duplicate/spaced 'app' directories
+          for item in os.listdir("."):
+              if item.strip().startswith("app") and os.path.isdir(item):
+                  shutil.rmtree(item)
+
+          # Recreate clean directory structure and write rescued files
+          os.makedirs("app/src/main/java/com/familyvault/app/crypto", exist_ok=True)
+          os.makedirs("app/src/main/java/com/familyvault/app/data/local", exist_ok=True)
+
+          for fname, dest_path in target_files.items():
+              if fname in rescued_contents:
+                  with open(dest_path, "wb") as out:
+                      out.write(rescued_contents[fname])
+                  print(f"Restored clean file -> {dest_path}")
+              else:
+                  print(f"⚠️ Warning: {fname} was not found in repository!")
           EOF
-          fi
 
-          # Ensure app/build.gradle.kts exists
-          if [ ! -f "app/build.gradle.kts" ]; then
-            cat << 'EOF' > app/build.gradle.kts
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-              id("org.jetbrains.kotlin.plugin.compose")
-              id("com.google.devtools.ksp")
-          }
-          android {
-              namespace = "com.familyvault.app"
-              compileSdk = 35
-              defaultConfig {
-                  applicationId = "com.familyvault.app"
-                  minSdk = 26
-                  targetSdk = 35
-                  versionCode = 1
-                  versionName = "0.1.0-alpha"
-              }
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-              kotlinOptions { jvmTarget = "17" }
-              buildFeatures { compose = true }
-              packaging {
-                  jniLibs { useLegacyPackaging = false }
-              }
-          }
-          dependencies {
-              implementation("androidx.core:core-ktx:1.15.0")
-              implementation("androidx.appcompat:appcompat:1.7.0")
-              implementation("androidx.activity:activity-compose:1.9.3")
-              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
-              implementation("androidx.biometric:biometric:1.1.0")
-              implementation("androidx.room:room-runtime:2.6.1")
-              implementation("androidx.room:room-ktx:2.6.1")
-              ksp("androidx.room:room-compiler:2.6.1")
-              implementation("net.zetetic:sqlcipher-android:4.6.1@aar")
-              implementation("androidx.sqlite:sqlite-ktx:2.4.0")
-              implementation("com.google.crypto.tink:tink-android:1.15.0")
-              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-              val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
-              implementation(composeBom)
-              implementation("androidx.compose.ui:ui")
-              implementation("androidx.compose.ui:ui-graphics")
-              implementation("androidx.compose.ui:ui-tooling-preview")
-              implementation("androidx.compose.material3:material3")
-          }
-          EOF
-          fi
-
+      - name: 3. Verify All 5 Kotlin Source Files Exist & Zero Internet Permission
+        run: |
+          for kt_file in \
+            "app/src/main/java/com/familyvault/app/MainActivity.kt" \
+            "app/src/main/java/com/familyvault/app/crypto/VaultCryptoManager.kt" \
+            "app/src/main/java/com/familyvault/app/data/local/Entities.kt" \
+            "app/src/main/java/com/familyvault/app/data/local/VaultDao.kt" \
+            "app/src/main/java/com/familyvault/app/data/local/VaultDatabase.kt"; do
+            if [ ! -f "$kt_file" ]; then
+              echo "❌ MISSING SOURCE FILE: $kt_file"
+              exit 1
+            fi
+          done
           if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
             echo "❌ SECURITY VIOLATION: INTERNET permission found!"
             exit 1
-          else
-            echo "✅ Zero-Network Manifest Verified."
           fi
+          echo "✅ All 5 Kotlin files and Zero-Network Manifest verified."
 
-      - name: 3. Enforce Root Gradle Configuration (AGP 8.5.0)
+      - name: 4. Enforce Root Gradle Configuration
         run: |
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -144,31 +123,38 @@ jobs:
           android.nonTransitiveRClass=true
           kotlin.code.style=official
           EOF
-          echo "✅ Root Gradle configuration enforced."
 
-      - name: 4. Set up JDK 17
+      - name: 5. Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 5. Accept Pre-Installed Android SDK Licenses
+      - name: 6. Accept Pre-Installed Android SDK Licenses
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
-          echo "✅ Android SDK Licenses Accepted"
 
-      - name: 6. Install Gradle 8.10.2
+      - name: 7. Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: 7. Compile Debug APK
+      - name: 8. Compile Debug APK
         run: gradle assembleDebug --no-daemon --stacktrace
 
-      - name: 8. Upload Compiled APK Artifact
+      - name: 9. Audit APK Bytecode (Verify MainActivity.class is Compiled)
+        run: |
+          if ! find app/build -name "MainActivity.class" | grep -q "MainActivity.class"; then
+            echo "❌ FATAL: MainActivity.class was NOT compiled! Aborting."
+            exit 1
+          fi
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep "classes.dex"
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep "libsqlcipher.so"
+          echo "✅ APK Bytecode Audit Passed: MainActivity.class and libsqlcipher.so verified!"
+
+      - name: 10. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FamilyVault-Sprint1-v0.1-alpha
+          name: FamilyVault-RealmeAndroid13-Verified
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          
