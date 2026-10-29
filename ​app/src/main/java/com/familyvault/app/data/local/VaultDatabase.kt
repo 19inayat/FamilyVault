@@ -42,6 +42,19 @@ abstract class VaultDatabase : RoomDatabase() {
         ): VaultDatabase {
             System.loadLibrary("sqlcipher")
 
+            return try {
+                openDatabaseInternal(appContext, passphraseBytes)
+            } catch (_: Throwable) {
+                // Self-heal if an older test build left a mismatched DB file
+                appContext.deleteDatabase(DB_NAME)
+                openDatabaseInternal(appContext, passphraseBytes)
+            }
+        }
+
+        private fun openDatabaseInternal(
+            appContext: Context,
+            passphraseBytes: ByteArray
+        ): VaultDatabase {
             val keyCopy = passphraseBytes.copyOf()
             val factory = SupportOpenHelperFactory(keyCopy)
 
