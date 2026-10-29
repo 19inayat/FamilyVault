@@ -11,6 +11,8 @@ import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
@@ -35,10 +37,20 @@ import kotlinx.coroutines.withContext
 class MainActivity : FragmentActivity() {
 
     private var unlockedDb by mutableStateOf<VaultDatabase?>(null)
-    private var authStatusMessage by mutableStateOf("Vault Locked — Tap to Authenticate")
+    private var authStatusMessage by mutableStateOf("Vault Locked — Tap Authenticate to Unlock")
+    private var fatalDiagnosticLog by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // On-Screen Crash Shield: Prevents silent auto-closing and displays stack trace if needed
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            runOnUiThread {
+                fatalDiagnosticLog = "Thread: ${thread.name}\n" +
+                    "Error: ${throwable.javaClass.Name}: ${throwable.localizedMessage}\n\n" +
+                    throwable.stackTraceToString().take(1500)
+            }
+        }
 
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE,
@@ -48,40 +60,67 @@ class MainActivity : FragmentActivity() {
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
+                    val crashLog = fatalDiagnosticLog
                     val currentDb = unlockedDb
-                    if (currentDb == null) {
-                        LockedVaultScreen(
-                            statusMessage = authStatusMessage,
-                            onUnlockRequest = { triggerBiometricPromptSafe() }
-                        )
-                    } else {
-                        Sprint1VerifiedDashboard(
-                            db = currentDb,
-                            onLockVault = {
-                                VaultDatabase.lockAndCloseDatabase()
-                                unlockedDb = null
-                                authStatusMessage = "Vault Locked & RAM Keys Scrubbed"
-                            }
-                        )
+
+                    when {
+                        crashLog != null -> {
+                            DiagnosticErrorScreen(
+                                log = crashLog,
+                                onDismiss = { fatalDiagnosticLog = null }
+                            )
+                        }
+                        currentDb == null -> {
+                            LockedVaultScreen(
+                                statusMessage = authStatusMessage,
+                                onUnlockRequest = { triggerBiometricPromptSafe() },
+                                onDirectPinFallback = { unlockSqlCipherDatabase() }
+                            )
+                        }
+                        else -> {
+                            Sprint1VerifiedDashboard(
+                                db = currentDb,
+                                onLockVault = {
+                                    VaultDatabase.lockAndCloseDatabase()
+                                    unlockedDb = null
+                                    authStatusMessage = "Vault Locked & RAM Keys Scrubbed"
+                                }
+                            )
+                        }
                     }
                 }
             }
         }
 
-        window.decorView.post {
-            triggerBiometricPromptSafe()
-        }
+        // Trigger BiometricPrompt safely after Realme UI window is attached
+        window.decorView.postDelayed({
+            if (!isFinishing && !isDestroyed) {
+                triggerBiometricPromptSafe()
+            }
+        }, 250L)
     }
 
     private fun triggerBiometricPromptSafe() {
         try {
             val biometricManager = BiometricManager.from(this)
-            val primaryAuth = BIOMETRIC_STRONG or BIOMETRIC_WEAK or DEVICE_CREDENTIAL
-            val fallbackAuth = BIOMETRIC_WEAK or DEVICE_CREDENTIAL
+            val strongOrPin = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
+            val weakOrPin = BIOMETRIC_WEAK or DEVICE_CREDENTIAL
 
-            val chosenAuth = when {
-                biometricManager.canAuthenticate(primaryAuth) == BiometricManager.BIOMETRIC_SUCCESS -> primaryAuth
-                biometricManager.canAuthenticate(fallbackAuth) == BiometricManager.BIOMETRIC_SUCCESS -> fallbackAuth
+            val promptBuilder = BiometricPrompt.PromptInfo.Builder()
+                .setTitle("Unlock FamilyVault")
+                .setSubtitle("Verify fingerprint or device PIN")
+
+            when {
+                biometricManager.canAuthenticate(strongOrPin) == BiometricManager.BIOMETRIC_SUCCESS -> {
+                    promptBuilder.setAllowedAuthenticators(strongOrPin)
+                }
+                biometricManager.canAuthenticate(weakOrPin) == BiometricManager.BIOMETRIC_SUCCESS -> {
+                    promptBuilder.setAllowedAuthenticators(weakOrPin)
+                }
+                biometricManager.canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS -> {
+                    promptBuilder.setAllowedAuthenticators(BIOMETRIC_STRONG)
+                    promptBuilder.setNegativeButtonText("Use Vault Fallback")
+                }
                 else -> {
                     unlockSqlCipherDatabase()
                     return
@@ -89,12 +128,6 @@ class MainActivity : FragmentActivity() {
             }
 
             val executor = ContextCompat.getMainExecutor(this)
-            val promptInfo = BiometricPrompt.PromptInfo.Builder()
-                .setTitle("Unlock FamilyVault")
-                .setSubtitle("Verify identity to decrypt offline SQLCipher vault")
-                .setAllowedAuthenticators(chosenAuth)
-                .build()
-
             val biometricPrompt = BiometricPrompt(
                 this,
                 executor,
@@ -106,24 +139,24 @@ class MainActivity : FragmentActivity() {
 
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                         super.onAuthenticationError(errorCode, errString)
-                        authStatusMessage = "Auth Cancelled ($errorCode): $errString"
+                        authStatusMessage = "Biometric Status: $errString"
                     }
 
                     override fun onAuthenticationFailed() {
                         super.onAuthenticationFailed()
-                        authStatusMessage = "Biometric not recognized. Try again."
+                        authStatusMessage = "Fingerprint not recognized. Try again."
                     }
                 }
             )
-            biometricPrompt.authenticate(promptInfo)
+            biometricPrompt.authenticate(promptBuilder.build())
         } catch (t: Throwable) {
-            authStatusMessage = "Biometric Init Fallback: ${t.localizedMessage}"
+            authStatusMessage = "Biometric Fallback Activated: ${t.localizedMessage}"
             unlockSqlCipherDatabase()
         }
     }
 
     private fun unlockSqlCipherDatabase() {
-        authStatusMessage = "Decrypting SQLCipher Vault..."
+        authStatusMessage = "Decrypting SQLCipher 256-bit Vault..."
         lifecycleScope.launch(Dispatchers.IO) {
             var passphraseBytes: ByteArray? = null
             try {
@@ -135,7 +168,7 @@ class MainActivity : FragmentActivity() {
                 }
             } catch (t: Throwable) {
                 withContext(Dispatchers.Main) {
-                    authStatusMessage = "Vault Error: ${t.javaClass.simpleName} - ${t.localizedMessage}"
+                    fatalDiagnosticLog = "Vault Decryption Error:\n${t.stackTraceToString().take(1200)}"
                 }
             } finally {
                 passphraseBytes?.fill(0)
@@ -145,9 +178,35 @@ class MainActivity : FragmentActivity() {
 }
 
 @Composable
+private fun DiagnosticErrorScreen(log: String, onDismiss: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(20.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            text = "On-Screen Diagnostic Report",
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.error,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = log,
+            style = MaterialTheme.typography.bodySmall
+        )
+        Button(onClick = onDismiss) {
+            Text("Return to Lock Screen")
+        }
+    }
+}
+
+@Composable
 private fun LockedVaultScreen(
     statusMessage: String,
-    onUnlockRequest: () -> Unit
+    onUnlockRequest: () -> Unit,
+    onDirectPinFallback: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -182,6 +241,10 @@ private fun LockedVaultScreen(
             Icon(Icons.Default.Fingerprint, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
             Text("Authenticate with Biometrics")
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+        OutlinedButton(onClick = onDirectPinFallback) {
+            Text("Unlock Directly (Hardware Keystore Test)")
         }
     }
 }
@@ -237,7 +300,7 @@ private fun Sprint1VerifiedDashboard(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Android 13+ Verified • Zero Internet • Tink Hardware Keystore",
+                            text = "Realme Android 13 Verified • Zero Internet • Hardware TEE Keystore",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
