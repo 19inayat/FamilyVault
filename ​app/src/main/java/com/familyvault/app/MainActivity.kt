@@ -14,9 +14,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,6 +29,7 @@ import com.familyvault.app.crypto.VaultCryptoManager
 import com.familyvault.app.data.local.DocumentEntity
 import com.familyvault.app.data.local.FamilyMemberEntity
 import com.familyvault.app.data.local.VaultDatabase
+import com.familyvault.app.data.local.searchDocumentsFts5
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -43,11 +43,11 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // On-Screen Crash Shield: Prevents silent auto-closing and displays stack trace if needed
+        // Fixed: uses lowercase .simpleName instead of .Name
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             runOnUiThread {
                 fatalDiagnosticLog = "Thread: ${thread.name}\n" +
-                    "Error: ${throwable.javaClass.Name}: ${throwable.localizedMessage}\n\n" +
+                    "Error: ${throwable.javaClass.simpleName}: ${throwable.localizedMessage}\n\n" +
                     throwable.stackTraceToString().take(1500)
             }
         }
@@ -92,7 +92,6 @@ class MainActivity : FragmentActivity() {
             }
         }
 
-        // Trigger BiometricPrompt safely after Realme UI window is attached
         window.decorView.postDelayed({
             if (!isFinishing && !isDestroyed) {
                 triggerBiometricPromptSafe()
@@ -238,7 +237,7 @@ private fun LockedVaultScreen(
             onClick = onUnlockRequest,
             contentPadding = PaddingValues(horizontal = 24.dp, vertical = 14.dp)
         ) {
-            Icon(Icons.Default.Fingerprint, contentDescription = null)
+            Icon(Icons.Default.Lock, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
             Text("Authenticate with Biometrics")
         }
@@ -288,7 +287,7 @@ private fun Sprint1VerifiedDashboard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Icon(
-                        imageVector = Icons.Default.VerifiedUser,
+                        imageVector = Icons.Default.CheckCircle,
                         contentDescription = null,
                         modifier = Modifier.size(36.dp)
                     )
