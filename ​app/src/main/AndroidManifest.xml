@@ -5,8 +5,6 @@
 
     <application
         android:allowBackup="false"
-        android:fullBackupContent="false"
-        android:dataExtractionRules="@null"
         android:icon="@android:drawable/ic_lock_lock"
         android:label="FamilyVault"
         android:supportsRtl="true"
@@ -16,6 +14,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
