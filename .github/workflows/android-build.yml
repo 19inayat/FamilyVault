@@ -1,0 +1,1882 @@
+name: Sprint 3 - FamilyVault Scanner, QR & Voice Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Cache Persistent Debug Keystore (Prevents Uninstall on Update)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: familyvault-persistent-debug-keystore-v1
+
+      - name: 3. Purge Old Spaced Folders & Generate Complete Sprint 3 Source Tree
+        run: |
+          # Remove any legacy or spaced 'app' directories in the workspace
+          python3 - << 'PYEOF'
+          import os, shutil
+          for item in os.listdir("."):
+              if item.strip().startswith("app") and os.path.isdir(item):
+                  shutil.rmtree(item)
+              elif item != item.strip():
+                  if os.path.isdir(item):
+                      shutil.rmtree(item)
+                  else:
+                      os.remove(item)
+          PYEOF
+
+          mkdir -p app/src/main/java/com/familyvault/app/crypto
+          mkdir -p app/src/main/java/com/familyvault/app/data/local
+          mkdir -p app/src/main/java/com/familyvault/app/domain
+          mkdir -p app/src/main/java/com/familyvault/app/scanner
+
+          # 1. AndroidManifest.xml (Zero Internet Permission)
+          sed 's/^          //' << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_lock_lock"
+                  android:label="FamilyVault"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # 2. VaultCryptoManager.kt (Android 13 Hardware Keystore AES-256-GCM)
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/crypto/VaultCryptoManager.kt
+          package com.familyvault.app.crypto
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import java.io.ByteArrayInputStream
+          import java.io.File
+          import java.io.InputStream
+          import java.security.KeyStore
+          import java.security.MessageDigest
+          import java.security.SecureRandom
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+
+          class VaultCryptoManager(context: Context) {
+
+              private val appContext = context.applicationContext
+              private val prefs = appContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+
+              private fun getOrCreateHardwareSecretKey(): SecretKey {
+                  val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                  val existingEntry = keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+                  if (existingEntry != null) return existingEntry.secretKey
+
+                  val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+                  val spec = KeyGenParameterSpec.Builder(
+                      KEY_ALIAS,
+                      KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                  )
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                      .setKeySize(256)
+                      .setRandomizedEncryptionRequired(true)
+                      .build()
+
+                  keyGenerator.init(spec)
+                  return keyGenerator.generateKey()
+              }
+
+              private fun encryptWithHardwareKey(plainBytes: ByteArray, associatedData: ByteArray): ByteArray {
+                  val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+                  cipher.init(Cipher.ENCRYPT_MODE, getOrCreateHardwareSecretKey())
+                  cipher.updateAAD(associatedData)
+                  val iv = cipher.iv
+                  val cipherBytes = cipher.doFinal(plainBytes)
+
+                  val combined = ByteArray(1 + iv.size + cipherBytes.size)
+                  combined[0] = iv.size.toByte()
+                  System.arraycopy(iv, 0, combined, 1, iv.size)
+                  System.arraycopy(cipherBytes, 0, combined, 1 + iv.size, cipherBytes.size)
+                  return combined
+              }
+
+              private fun decryptWithHardwareKey(combined: ByteArray, associatedData: ByteArray): ByteArray {
+                  val ivSize = combined[0].toInt() and 0xFF
+                  val iv = combined.copyOfRange(1, 1 + ivSize)
+                  val cipherBytes = combined.copyOfRange(1 + ivSize, combined.size)
+
+                  val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+                  val spec = GCMParameterSpec(GCM_TAG_BITS, iv)
+                  cipher.init(Cipher.DECRYPT_MODE, getOrCreateHardwareSecretKey(), spec)
+                  cipher.updateAAD(associatedData)
+                  return cipher.doFinal(cipherBytes)
+              }
+
+              fun getOrCreateDatabasePassphrase(): ByteArray {
+                  val existingB64 = prefs.getString(ENCRYPTED_DB_PASS_KEY, null)
+                  if (existingB64 != null) {
+                      try {
+                          val combined = Base64.decode(existingB64, Base64.NO_WRAP)
+                          return decryptWithHardwareKey(combined, DB_AAD)
+                      } catch (_: Throwable) {
+                          prefs.edit().remove(ENCRYPTED_DB_PASS_KEY).commit()
+                      }
+                  }
+
+                  val newPassphrase = ByteArray(32).also { SecureRandom().nextBytes(it) }
+                  val encrypted = encryptWithHardwareKey(newPassphrase, DB_AAD)
+                  prefs.edit()
+                      .putString(ENCRYPTED_DB_PASS_KEY, Base64.encodeToString(encrypted, Base64.NO_WRAP))
+                      .commit()
+                  return newPassphrase
+              }
+
+              fun encryptStreamToVaultFile(
+                  inputStream: InputStream,
+                  destinationFile: File,
+                  associatedData: String
+              ): String {
+                  val rawBytes = inputStream.readBytes()
+                  val digest = MessageDigest.getInstance("SHA-256").digest(rawBytes)
+                  val encryptedBytes = encryptWithHardwareKey(rawBytes, associatedData.toByteArray())
+                  destinationFile.writeBytes(encryptedBytes)
+                  return digest.joinToString("") { "%02x".format(it) }
+              }
+
+              fun openDecryptedStream(encryptedFile: File, associatedData: String): InputStream {
+                  val encryptedBytes = encryptedFile.readBytes()
+                  val decryptedBytes = decryptWithHardwareKey(encryptedBytes, associatedData.toByteArray())
+                  return ByteArrayInputStream(decryptedBytes)
+              }
+
+              companion object {
+                  private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+                  private const val KEY_ALIAS = "family_vault_hw_aes256_v2"
+                  private const val AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
+                  private const val GCM_TAG_BITS = 128
+                  private const val PREFS_FILE = "family_vault_secure_prefs"
+                  private const val ENCRYPTED_DB_PASS_KEY = "wrapped_sqlcipher_pass_v2"
+                  private val DB_AAD = "SQLCipher_FamilyVault_v2".toByteArray()
+              }
+          }
+          EOF
+
+          # 3. Entities.kt
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/data/local/Entities.kt
+          package com.familyvault.app.data.local
+
+          import androidx.room.ColumnInfo
+          import androidx.room.Entity
+          import androidx.room.ForeignKey
+          import androidx.room.Index
+          import androidx.room.PrimaryKey
+
+          @Entity(
+              tableName = "family_members",
+              indices = [
+                  Index(value = ["canonical_name"], unique = true),
+                  Index(value = ["sorted_tokens"])
+              ]
+          )
+          data class FamilyMemberEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "member_id") val memberId: Long = 0,
+              @ColumnInfo(name = "canonical_name") val canonicalName: String,
+              @ColumnInfo(name = "sorted_tokens") val sortedTokens: String,
+              @ColumnInfo(name = "phonetic_primary") val phoneticPrimary: String,
+              @ColumnInfo(name = "phonetic_secondary") val phoneticSecondary: String? = null,
+              @ColumnInfo(name = "relationship_role") val relationshipRole: String,
+              @ColumnInfo(name = "blood_group") val bloodGroup: String? = null,
+              @ColumnInfo(name = "legacy_folder_uri") val legacyFolderUri: String? = null,
+              @ColumnInfo(name = "created_at") val createdAt: Long = System.currentTimeMillis()
+          )
+
+          @Entity(
+              tableName = "member_aliases",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = FamilyMemberEntity::class,
+                      parentColumns = ["member_id"],
+                      childColumns = ["member_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [
+                  Index(value = ["member_id"]),
+                  Index(value = ["alias_normalized"], unique = true)
+              ]
+          )
+          data class MemberAliasEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "alias_id") val aliasId: Long = 0,
+              @ColumnInfo(name = "member_id") val memberId: Long,
+              @ColumnInfo(name = "alias_normalized") val aliasNormalized: String
+          )
+
+          @Entity(
+              tableName = "documents",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = FamilyMemberEntity::class,
+                      parentColumns = ["member_id"],
+                      childColumns = ["member_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [
+                  Index(value = ["member_id"]),
+                  Index(value = ["doc_category", "doc_sub_type"]),
+                  Index(value = ["expiry_date"])
+              ]
+          )
+          data class DocumentEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "doc_id") val docId: Long = 0,
+              @ColumnInfo(name = "member_id") val memberId: Long,
+              @ColumnInfo(name = "doc_category") val docCategory: String,
+              @ColumnInfo(name = "doc_sub_type") val docSubType: String,
+              @ColumnInfo(name = "name_on_document") val nameOnDocument: String,
+              @ColumnInfo(name = "document_number") val documentNumber: String,
+              @ColumnInfo(name = "issuing_authority") val issuingAuthority: String,
+              @ColumnInfo(name = "issue_date") val issueDate: String? = null,
+              @ColumnInfo(name = "expiry_date") val expiryDate: String? = null,
+              @ColumnInfo(name = "linked_mobile") val linkedMobile: String? = null,
+              @ColumnInfo(name = "extra_attributes_json") val extraAttributesJson: String = "{}",
+              @ColumnInfo(name = "raw_extracted_text") val rawExtractedText: String,
+              @ColumnInfo(name = "extraction_source") val extractionSource: String,
+              @ColumnInfo(name = "version_number") val versionNumber: Int = 1,
+              @ColumnInfo(name = "updated_at") val updatedAt: Long = System.currentTimeMillis()
+          )
+
+          @Entity(
+              tableName = "document_attachments",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = DocumentEntity::class,
+                      parentColumns = ["doc_id"],
+                      childColumns = ["doc_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [
+                  Index(value = ["doc_id"]),
+                  Index(value = ["sha256_hash"], unique = true)
+              ]
+          )
+          data class DocumentAttachmentEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "attachment_id") val attachmentId: Long = 0,
+              @ColumnInfo(name = "doc_id") val docId: Long,
+              @ColumnInfo(name = "page_order") val pageOrder: Int,
+              @ColumnInfo(name = "file_role") val fileRole: String,
+              @ColumnInfo(name = "tink_encrypted_path") val tinkEncryptedPath: String,
+              @ColumnInfo(name = "sha256_hash") val sha256Hash: String
+          )
+
+          @Entity(
+              tableName = "document_history",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = DocumentEntity::class,
+                      parentColumns = ["doc_id"],
+                      childColumns = ["doc_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [Index(value = ["doc_id"])]
+          )
+          data class DocumentHistoryEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "history_id") val historyId: Long = 0,
+              @ColumnInfo(name = "doc_id") val docId: Long,
+              @ColumnInfo(name = "version_number") val versionNumber: Int,
+              @ColumnInfo(name = "old_document_number") val oldDocumentNumber: String,
+              @ColumnInfo(name = "old_issue_date") val oldIssueDate: String? = null,
+              @ColumnInfo(name = "old_expiry_date") val oldExpiryDate: String? = null,
+              @ColumnInfo(name = "old_encrypted_path") val oldEncryptedPath: String,
+              @ColumnInfo(name = "archived_at") val archivedAt: Long = System.currentTimeMillis()
+          )
+          EOF
+
+          # 4. VaultDao.kt
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/data/local/VaultDao.kt
+          package com.familyvault.app.data.local
+
+          import androidx.room.Dao
+          import androidx.room.Insert
+          import androidx.room.OnConflictStrategy
+          import androidx.room.Query
+          import androidx.room.RawQuery
+          import androidx.room.Update
+          import androidx.sqlite.db.SimpleSQLiteQuery
+          import androidx.sqlite.db.SupportSQLiteQuery
+          import kotlinx.coroutines.flow.Flow
+
+          @Dao
+          interface VaultDao {
+              @Insert(onConflict = OnConflictStrategy.ABORT)
+              suspend fun insertFamilyMember(member: FamilyMemberEntity): Long
+
+              @Insert(onConflict = OnConflictStrategy.IGNORE)
+              suspend fun insertAlias(alias: MemberAliasEntity): Long
+
+              @Query("SELECT * FROM family_members ORDER BY canonical_name ASC")
+              fun observeAllFamilyMembers(): Flow<List<FamilyMemberEntity>>
+
+              @Query("SELECT * FROM family_members")
+              suspend fun getAllFamilyMembersOnce(): List<FamilyMemberEntity>
+
+              @Query("SELECT member_id FROM member_aliases WHERE alias_normalized = :normalizedAlias LIMIT 1")
+              suspend fun findMemberIdByAlias(normalizedAlias: String): Long?
+
+              @Query("SELECT * FROM documents ORDER BY updated_at DESC")
+              fun observeAllDocuments(): Flow<List<DocumentEntity>>
+
+              @Query("SELECT * FROM documents WHERE member_id = :memberId AND doc_sub_type = :subType LIMIT 1")
+              suspend fun findExistingDocumentBySubType(memberId: Long, subType: String): DocumentEntity?
+
+              @Insert(onConflict = OnConflictStrategy.REPLACE)
+              suspend fun insertDocument(document: DocumentEntity): Long
+
+              @Update
+              suspend fun updateDocument(document: DocumentEntity)
+
+              @Insert(onConflict = OnConflictStrategy.IGNORE)
+              suspend fun insertAttachment(attachment: DocumentAttachmentEntity): Long
+
+              @Insert(onConflict = OnConflictStrategy.REPLACE)
+              suspend fun insertDocumentHistory(history: DocumentHistoryEntity): Long
+
+              @Query("SELECT * FROM documents WHERE member_id = :memberId ORDER BY doc_category, doc_sub_type")
+              fun observeDocumentsForMember(memberId: Long): Flow<List<DocumentEntity>>
+
+              @Query("DELETE FROM family_members WHERE canonical_name = 'Self Profile (Test)'")
+              suspend fun cleanupSprint1TestProfile()
+
+              @RawQuery(observedEntities = [DocumentEntity::class])
+              suspend fun executeRawDocumentSearch(query: SupportSQLiteQuery): List<DocumentEntity>
+          }
+
+          suspend fun VaultDao.upsertDocumentWithVersionAudit(incoming: DocumentEntity): Pair<Long, String> {
+              val existing = findExistingDocumentBySubType(incoming.memberId, incoming.docSubType)
+              if (existing == null) {
+                  val id = insertDocument(incoming)
+                  return Pair(id, "Inserted v1 (${incoming.docSubType})")
+              }
+              return if (existing.documentNumber.equals(incoming.documentNumber, ignoreCase = true)) {
+                  val updated = incoming.copy(
+                      docId = existing.docId,
+                      versionNumber = existing.versionNumber,
+                      updatedAt = System.currentTimeMillis()
+                  )
+                  updateDocument(updated)
+                  Pair(existing.docId, "Updated existing ${incoming.docSubType}")
+              } else {
+                  insertDocumentHistory(
+                      DocumentHistoryEntity(
+                          docId = existing.docId,
+                          versionNumber = existing.versionNumber,
+                          oldDocumentNumber = existing.documentNumber,
+                          oldIssueDate = existing.issueDate,
+                          oldExpiryDate = existing.expiryDate,
+                          oldEncryptedPath = "vault_archive_v${existing.versionNumber}"
+                      )
+                  )
+                  val newVersion = existing.versionNumber + 1
+                  updateDocument(incoming.copy(docId = existing.docId, versionNumber = newVersion, updatedAt = System.currentTimeMillis()))
+                  Pair(existing.docId, "Archived v${existing.versionNumber} & Upgraded to v$newVersion")
+              }
+          }
+
+          suspend fun VaultDao.searchDocumentsFts5(searchTerm: String): List<DocumentEntity> {
+              val sanitized = searchTerm.replace("\"", "\"\"").trim()
+              if (sanitized.isEmpty()) return emptyList()
+              return try {
+                  val sql = "SELECT d.* FROM documents d INNER JOIN documents_fts fts ON d.doc_id = fts.rowid WHERE documents_fts MATCH '\"$sanitized\"' ORDER BY d.updated_at DESC"
+                  executeRawDocumentSearch(SimpleSQLiteQuery(sql))
+              } catch (_: Throwable) {
+                  val fallbackSql = "SELECT * FROM documents WHERE raw_extracted_text LIKE '%$sanitized%' OR document_number LIKE '%$sanitized%' ORDER BY updated_at DESC"
+                  executeRawDocumentSearch(SimpleSQLiteQuery(fallbackSql))
+              }
+          }
+          EOF
+
+          # 5. VaultDatabase.kt
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/data/local/VaultDatabase.kt
+          package com.familyvault.app.data.local
+
+          import android.content.Context
+          import androidx.room.Database
+          import androidx.room.Room
+          import androidx.room.RoomDatabase
+          import androidx.sqlite.db.SupportSQLiteDatabase
+          import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
+
+          @Database(
+              entities = [
+                  FamilyMemberEntity::class,
+                  MemberAliasEntity::class,
+                  DocumentEntity::class,
+                  DocumentAttachmentEntity::class,
+                  DocumentHistoryEntity::class
+              ],
+              version = 1,
+              exportSchema = false
+          )
+          abstract class VaultDatabase : RoomDatabase() {
+
+              abstract fun vaultDao(): VaultDao
+
+              companion object {
+                  private const val DB_NAME = "family_vault_v2_encrypted.db"
+
+                  @Volatile
+                  private var INSTANCE: VaultDatabase? = null
+
+                  fun getUnlockedInstance(context: Context, passphraseBytes: ByteArray): VaultDatabase {
+                      return INSTANCE ?: synchronized(this) {
+                          INSTANCE ?: buildEncryptedDatabase(context.applicationContext, passphraseBytes).also {
+                              INSTANCE = it
+                          }
+                      }
+                  }
+
+                  private fun buildEncryptedDatabase(
+                      appContext: Context,
+                      passphraseBytes: ByteArray
+                  ): VaultDatabase {
+                      System.loadLibrary("sqlcipher")
+                      return try {
+                          openDatabaseInternal(appContext, passphraseBytes)
+                      } catch (_: Throwable) {
+                          appContext.deleteDatabase(DB_NAME)
+                          openDatabaseInternal(appContext, passphraseBytes)
+                      }
+                  }
+
+                  private fun openDatabaseInternal(
+                      appContext: Context,
+                      passphraseBytes: ByteArray
+                  ): VaultDatabase {
+                      val keyCopy = passphraseBytes.copyOf()
+                      val factory = SupportOpenHelperFactory(keyCopy)
+                      return Room.databaseBuilder(appContext, VaultDatabase::class.java, DB_NAME)
+                          .openHelperFactory(factory)
+                          .addCallback(Fts5BootstrapCallback())
+                          .fallbackToDestructiveMigrationOnDowngrade()
+                          .build()
+                          .also { db -> db.openHelper.writableDatabase }
+                  }
+
+                  fun lockAndCloseDatabase() {
+                      synchronized(this) {
+                          INSTANCE?.close()
+                          INSTANCE = null
+                      }
+                  }
+              }
+
+              private class Fts5BootstrapCallback : Callback() {
+                  override fun onCreate(db: SupportSQLiteDatabase) {
+                      super.onCreate(db)
+                      try {
+                          db.execSQL(
+                              "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text, content='documents', content_rowid='doc_id', tokenize='trigram');"
+                          )
+                      } catch (_: Throwable) {
+                          db.execSQL(
+                              "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text, content='documents', content_rowid='doc_id');"
+                          )
+                      }
+                      db.execSQL(
+                          "CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN INSERT INTO documents_fts(rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES (new.doc_id, new.name_on_document, new.document_number, new.issuing_authority, new.extra_attributes_json, new.raw_extracted_text); END;"
+                      )
+                      db.execSQL(
+                          "CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN INSERT INTO documents_fts(documents_fts, rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES ('delete', old.doc_id, old.name_on_document, old.document_number, old.issuing_authority, old.extra_attributes_json, old.raw_extracted_text); END;"
+                      )
+                      db.execSQL(
+                          "CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN INSERT INTO documents_fts(documents_fts, rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES ('delete', old.doc_id, old.name_on_document, old.document_number, old.issuing_authority, old.extra_attributes_json, old.raw_extracted_text); INSERT INTO documents_fts(rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES (new.doc_id, new.name_on_document, new.document_number, new.issuing_authority, new.extra_attributes_json, new.raw_extracted_text); END;"
+                      )
+                  }
+              }
+          }
+          EOF
+
+          # 6. NameResolutionEngine.kt
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/domain/NameResolutionEngine.kt
+          package com.familyvault.app.domain
+
+          import com.familyvault.app.data.local.FamilyMemberEntity
+          import kotlin.math.max
+          import kotlin.math.min
+
+          sealed class NameResolutionResult {
+              data class ExactOrAliasMatch(
+                  val member: FamilyMemberEntity,
+                  val matchedVia: String
+              ) : NameResolutionResult()
+
+              data class MinimalMismatchAlert(
+                  val candidateMember: FamilyMemberEntity,
+                  val extractedRawName: String,
+                  val normalizedAliasToSave: String,
+                  val similarityScore: Double,
+                  val editDistance: Int,
+                  val matchReason: String
+              ) : NameResolutionResult()
+
+              data class NewMemberDetected(
+                  val cleanedDisplayName: String,
+                  val sortedTokens: String,
+                  val phoneticCode: String
+              ) : NameResolutionResult()
+          }
+
+          object NameResolutionEngine {
+
+              private val HONORIFICS = setOf(
+                  "MR", "MRS", "MS", "MISS", "SRI", "SMT", "SHREE", "SHRI",
+                  "KUMARI", "KUM", "DR", "PROF", "LATE", "MASTER"
+              )
+
+              private val TOKEN_SYNONYMS = mapOf(
+                  "MOHD" to "MOHAMMED",
+                  "MD" to "MOHAMMED",
+                  "MAHAMMAD" to "MOHAMMED",
+                  "MUHAMMAD" to "MOHAMMED",
+                  "ABD" to "ABDUL"
+              )
+
+              fun normalizeToSortedTokens(rawName: String): String {
+                  return extractCleanTokens(rawName).sorted().joinToString(" ")
+              }
+
+              fun formatCanonicalDisplayName(rawName: String): String {
+                  val tokens = rawName
+                      .replace(Regex("[^A-Za-z.\\s]"), " ")
+                      .trim()
+                      .split(Regex("\\s+"))
+                      .filter { it.isNotBlank() && it.uppercase().removeSuffix(".") !in HONORIFICS }
+
+                  return tokens.joinToString(" ") { token ->
+                      token.lowercase().replaceFirstChar { it.uppercase() }
+                  }
+              }
+
+              private fun extractCleanTokens(rawName: String): List<String> {
+                  return rawName
+                      .uppercase()
+                      .replace(Regex("[^A-Z\\s]"), " ")
+                      .split(Regex("\\s+"))
+                      .map { it.trim() }
+                      .filter { it.isNotEmpty() && it !in HONORIFICS }
+                      .map { TOKEN_SYNONYMS[it] ?: it }
+              }
+
+              fun computePhoneticSignature(rawName: String): String {
+                  val joined = extractCleanTokens(rawName).sorted().joinToString("")
+                  if (joined.isEmpty()) return "UNK"
+                  val firstChar = joined.first()
+                  val normalized = joined
+                      .replace("PH", "F")
+                      .replace("BH", "B")
+                      .replace("DH", "D")
+                      .replace("TH", "T")
+                      .replace("KH", "K")
+                      .replace("GH", "G")
+                      .replace("SH", "S")
+                      .replace("Z", "S")
+                      .replace("V", "W")
+                      .replace("Y", "I")
+                      .replace(Regex("[AEIOUHW]"), "")
+                      .replace(Regex("(.)\\1+"), "$1")
+                  return (firstChar + normalized.drop(1)).take(8)
+              }
+
+              fun resolveIdentity(
+                  extractedRawName: String,
+                  existingMembers: List<FamilyMemberEntity>,
+                  aliasMemberIdIfFound: Long?
+              ): NameResolutionResult {
+                  val cleanedDisplay = formatCanonicalDisplayName(extractedRawName).ifEmpty { "Unknown Name" }
+                  val inputSortedTokens = normalizeToSortedTokens(extractedRawName)
+                  val inputPhonetic = computePhoneticSignature(extractedRawName)
+
+                  if (aliasMemberIdIfFound != null) {
+                      val matchedMember = existingMembers.find { it.memberId == aliasMemberIdIfFound }
+                      if (matchedMember != null) {
+                          return NameResolutionResult.ExactOrAliasMatch(
+                              member = matchedMember,
+                              matchedVia = "Saved Alias ('$cleanedDisplay')"
+                          )
+                      }
+                  }
+
+                  for (member in existingMembers) {
+                      if (member.sortedTokens.equals(inputSortedTokens, ignoreCase = true)) {
+                          return NameResolutionResult.ExactOrAliasMatch(
+                              member = member,
+                              matchedVia = "Exact Canonical Match"
+                          )
+                      }
+                  }
+
+                  val inputTokenList = extractCleanTokens(extractedRawName)
+                  var bestCandidate: FamilyMemberEntity? = null
+                  var bestJaroWinkler = 0.0
+                  var bestEditDistance = Int.MAX_VALUE
+                  var bestReason = ""
+
+                  for (member in existingMembers) {
+                      val targetTokens = member.sortedTokens
+                      val ocrInput = normalizeOcrConfusables(inputSortedTokens)
+                      val ocrTarget = normalizeOcrConfusables(targetTokens)
+
+                      val jwScore = max(
+                          jaroWinklerSimilarity(inputSortedTokens, targetTokens),
+                          jaroWinklerSimilarity(ocrInput, ocrTarget)
+                      )
+                      val editDist = min(
+                          levenshteinDistance(inputSortedTokens, targetTokens),
+                          levenshteinDistance(ocrInput, ocrTarget)
+                      )
+                      val isInitialMatch = checkIndianInitialExpansion(
+                          inputTokenList,
+                          extractCleanTokens(member.canonicalName)
+                      )
+                      val isPhoneticMatch = member.phoneticPrimary == inputPhonetic && jwScore >= 0.78
+
+                      if (isInitialMatch || (editDist <= 2 && targetTokens.length >= 5) || jwScore >= 0.84 || isPhoneticMatch) {
+                          val effectiveScore = when {
+                              isInitialMatch -> max(jwScore, 0.92)
+                              isPhoneticMatch -> max(jwScore, 0.88)
+                              else -> jwScore
+                          }
+                          if (effectiveScore > bestJaroWinkler) {
+                              bestJaroWinkler = effectiveScore
+                              bestEditDistance = editDist
+                              bestCandidate = member
+                              bestReason = when {
+                                  isInitialMatch -> "Initial expansion match ('$cleanedDisplay' <-> '${member.canonicalName}')"
+                                  editDist <= 2 -> "Spelling typo detected (Edit distance: $editDist char)"
+                                  isPhoneticMatch -> "Phonetic sound-alike match"
+                                  else -> "Fuzzy similarity (${(effectiveScore * 100).toInt()}%)"
+                              }
+                          }
+                      }
+                  }
+
+                  if (bestCandidate != null) {
+                      return NameResolutionResult.MinimalMismatchAlert(
+                          candidateMember = bestCandidate,
+                          extractedRawName = cleanedDisplay,
+                          normalizedAliasToSave = inputSortedTokens,
+                          similarityScore = bestJaroWinkler,
+                          editDistance = bestEditDistance,
+                          matchReason = bestReason
+                      )
+                  }
+
+                  return NameResolutionResult.NewMemberDetected(
+                      cleanedDisplayName = cleanedDisplay,
+                      sortedTokens = inputSortedTokens,
+                      phoneticCode = inputPhonetic
+                  )
+              }
+
+              private fun checkIndianInitialExpansion(tokensA: List<String>, tokensB: List<String>): Boolean {
+                  if (tokensA.size < 2 || tokensB.size < 2 || tokensA.size != tokensB.size) return false
+                  val fullWordsA = tokensA.filter { it.length > 1 }
+                  val initialsA = tokensA.filter { it.length == 1 }
+                  if (initialsA.isNotEmpty() && fullWordsA.isNotEmpty()) {
+                      val remainingB = tokensB.toMutableList()
+                      for (wordA in fullWordsA) {
+                          val matchIdx = remainingB.indexOfFirst {
+                              levenshteinDistance(wordA, it) <= 1 || jaroWinklerSimilarity(wordA, it) >= 0.88
+                          }
+                          if (matchIdx == -1) return false
+                          remainingB.removeAt(matchIdx)
+                      }
+                      for (initA in initialsA) {
+                          val initIdx = remainingB.indexOfFirst { it.startsWith(initA) }
+                          if (initIdx == -1) return false
+                          remainingB.removeAt(initIdx)
+                      }
+                      return remainingB.isEmpty()
+                  }
+                  return false
+              }
+
+              private fun normalizeOcrConfusables(input: String): String {
+                  return input.replace('0', 'O').replace('1', 'I').replace('L', 'I').replace('5', 'S').replace('8', 'B')
+              }
+
+              fun levenshteinDistance(s1: String, s2: String): Int {
+                  if (s1 == s2) return 0
+                  if (s1.isEmpty()) return s2.length
+                  if (s2.isEmpty()) return s1.length
+                  var prev = IntArray(s2.length + 1) { it }
+                  var curr = IntArray(s2.length + 1)
+                  for (i in 1..s1.length) {
+                      curr[0] = i
+                      for (j in 1..s2.length) {
+                          val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
+                          curr[j] = minOf(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+                      }
+                      val temp = prev; prev = curr; curr = temp
+                  }
+                  return prev[s2.length]
+              }
+
+              fun jaroWinklerSimilarity(s1: String, s2: String): Double {
+                  if (s1 == s2) return 1.0
+                  if (s1.isEmpty() || s2.isEmpty()) return 0.0
+                  val matchDistance = max(s1.length, s2.length) / 2 - 1
+                  val s1Matches = BooleanArray(s1.length)
+                  val s2Matches = BooleanArray(s2.length)
+                  var matches = 0
+                  for (i in s1.indices) {
+                      val start = max(0, i - matchDistance)
+                      val end = min(i + matchDistance + 1, s2.length)
+                      for (j in start until end) {
+                          if (s2Matches[j] || s1[i] != s2[j]) continue
+                          s1Matches[i] = true; s2Matches[j] = true; matches++; break
+                      }
+                  }
+                  if (matches == 0) return 0.0
+                  var t = 0; var k = 0
+                  for (i in s1.indices) {
+                      if (!s1Matches[i]) continue
+                      while (!s2Matches[k]) k++
+                      if (s1[i] != s2[k]) t++
+                      k++
+                  }
+                  val m = matches.toDouble()
+                  val jaro = ((m / s1.length) + (m / s2.length) + ((m - t / 2.0) / m)) / 3.0
+                  var prefix = 0
+                  for (i in 0 until minOf(4, s1.length, s2.length)) {
+                      if (s1[i] == s2[i]) prefix++ else break
+                  }
+                  return jaro + (prefix * 0.1 * (1.0 - jaro))
+              }
+          }
+          EOF
+
+          # 7. DocumentParserEngine.kt
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/domain/DocumentParserEngine.kt
+          package com.familyvault.app.domain
+
+          import org.json.JSONObject
+
+          data class ParsedDocumentPayload(
+              val docCategory: String,
+              val docSubType: String,
+              val issuingAuthority: String,
+              val extractedName: String,
+              val documentNumber: String,
+              val issueDate: String?,
+              val expiryDate: String?,
+              val linkedMobile: String?,
+              val extraAttributesJson: String,
+              val rawText: String
+          )
+
+          object DocumentParserEngine {
+
+              private val PAN_REGEX = Regex("\\b([A-Z]{5}[0-9]{4}[A-Z])\\b")
+              private val IFSC_REGEX = Regex("\\b([A-Z]{4}0[A-Z0-9]{6})\\b")
+              private val DL_REGEX = Regex("\\b([A-Z]{2}[-\\s]?[0-9]{2}[-\\s]?[0-9]{4}[-\\s]?[0-9]{7})\\b")
+              private val NADA_KACHERI_RD_REGEX = Regex("\\b(RD[0-9]{13})\\b")
+              private val PASSPORT_REGEX = Regex("\\b([A-Z][0-9]{7})\\b")
+              private val EPIC_VOTER_REGEX = Regex("\\b([A-Z]{3}[0-9]{7})\\b")
+              private val MOBILE_REGEX = Regex("\\b([6-9][0-9]{9})\\b")
+              private val DATE_REGEX = Regex("\\b([0-3][0-9])[/-]([0-1][0-9])[/-](19[0-9]{2}|20[0-9]{2})\\b")
+              private val TWELVE_DIGIT_REGEX = Regex("\\b([2-9][0-9]{3}[\\s-]?[0-9]{4}[\\s-]?[0-9]{4})\\b")
+
+              fun parseDocumentText(rawInput: String): ParsedDocumentPayload {
+                  val cleanText = rawInput.trim()
+                  val upperText = cleanText.uppercase()
+                  val lines = cleanText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+                  val (category, subType, defaultAuthority) = classifyDocument(upperText)
+                  val docNumber = extractPrimaryDocumentNumber(upperText, subType)
+                  val extractedName = extractPersonName(lines)
+                  val (issueDate, expiryDate, dob) = extractDates(lines)
+                  val linkedMobile = MOBILE_REGEX.find(cleanText)?.groupValues?.get(1)
+                  val extraJson = buildExtraAttributesJson(upperText, lines, subType, dob)
+
+                  return ParsedDocumentPayload(
+                      docCategory = category,
+                      docSubType = subType,
+                      issuingAuthority = defaultAuthority,
+                      extractedName = extractedName,
+                      documentNumber = docNumber,
+                      issueDate = issueDate,
+                      expiryDate = expiryDate,
+                      linkedMobile = linkedMobile,
+                      extraAttributesJson = extraJson,
+                      rawText = cleanText
+                  )
+              }
+
+              private fun classifyDocument(upperText: String): Triple<String, String, String> {
+                  return when {
+                      upperText.contains("INCOME TAX DEPARTMENT") || upperText.contains("PERMANENT ACCOUNT NUMBER") || PAN_REGEX.containsMatchIn(upperText) ->
+                          Triple("ID_CARD", "PAN Card", "Income Tax Department, Govt. of India")
+                      upperText.contains("DRIVING LICENCE") || upperText.contains("DRIVING LICENSE") || DL_REGEX.containsMatchIn(upperText) ->
+                          Triple("ID_CARD", "Driving License", "Regional Transport Office (RTO)")
+                      upperText.contains("NADA KACHERI") || upperText.contains("TAHSILDAR") || NADA_KACHERI_RD_REGEX.containsMatchIn(upperText) ->
+                          Triple("GOVT_CERT", "Nada Kacheri Certificate", "Revenue Department (Nada Kacheri)")
+                      upperText.contains("PASSBOOK") || upperText.contains("IFSC") || IFSC_REGEX.containsMatchIn(upperText) ->
+                          Triple("BANK_PASSBOOK", "Bank Passbook", detectBankAuthority(upperText))
+                      upperText.contains("REPUBLIC OF INDIA") && (upperText.contains("PASSPORT") || upperText.contains("P<IND")) ->
+                          Triple("PASSPORT", "Indian Passport", "Ministry of External Affairs, Govt. of India")
+                      upperText.contains("ELECTION COMMISSION") || upperText.contains("ELECTOR PHOTO") ->
+                          Triple("ID_CARD", "Voter ID (EPIC)", "Election Commission of India")
+                      upperText.contains("MARKS") || upperText.contains("SECONDARY EDUCATION") || upperText.contains("UNIVERSITY") ->
+                          Triple("MARKS_CARD", "Academic Marks Card", "Examination Board / University")
+                      upperText.contains("UNIQUE IDENTIFICATION") || upperText.contains("UIDAI") ->
+                          Triple("ID_CARD", "National ID Card", "Unique Identification Authority of India")
+                      else ->
+                          Triple("GOVT_CERT", "General Document", "Government / Institutional Authority")
+                  }
+              }
+
+              private fun extractPrimaryDocumentNumber(upperText: String, subType: String): String {
+                  PAN_REGEX.find(upperText)?.value?.let { return it }
+                  NADA_KACHERI_RD_REGEX.find(upperText)?.value?.let { return it }
+                  DL_REGEX.find(upperText)?.value?.let { return it.replace("\\s+".toRegex(), " ") }
+
+                  if (subType == "Bank Passbook") {
+                      val accMatch = Regex("(?:A/C\\s*NO|ACCOUNT\\s*NO|ACC\\s*NO|NUMBER)[\\s.:-]*([0-9]{9,18})").find(upperText)
+                      if (accMatch != null) return accMatch.groupValues[1]
+                  }
+                  if (subType == "Academic Marks Card") {
+                      val regMatch = Regex("(?:REG\\.?\\s*NO|REGISTER\\s*NO|ROLL\\s*NO)[\\s.:-]*([A-Z0-9]{5,15})").find(upperText)
+                      if (regMatch != null) return regMatch.groupValues[1]
+                  }
+                  PASSPORT_REGEX.find(upperText)?.value?.let { if (subType == "Indian Passport") return it }
+                  EPIC_VOTER_REGEX.find(upperText)?.value?.let { if (subType == "Voter ID (EPIC)") return it }
+
+                  TWELVE_DIGIT_REGEX.findAll(upperText).forEach { match ->
+                      val digitsOnly = match.value.replace(Regex("[^0-9]"), "")
+                      if (digitsOnly.length == 12 && validateVerhoeffChecksum(digitsOnly)) {
+                          return "XXXX-XXXX-${digitsOnly.takeLast(4)}"
+                      }
+                  }
+
+                  val genericNo = Regex("(?:DOC\\s*NO|CERT\\s*NO|NUMBER|ID\\s*NO)[\\s.:-]*([A-Z0-9/-]{5,20})").find(upperText)
+                  return genericNo?.groupValues?.get(1) ?: "UNPARSED-NO"
+              }
+
+              private fun extractPersonName(lines: List<String>): String {
+                  val nameLabelRegex = Regex(
+                      "^(?:CANDIDATE'?S?\\s*NAME|STUDENT\\s*NAME|ACCOUNT\\s*HOLDER(?:\\s*NAME)?|APPLICANT\\s*NAME|NAME)\\s*[:.-]+\\s*(.+)$",
+                      RegexOption.IGNORE_CASE
+                  )
+                  for (line in lines) {
+                      val match = nameLabelRegex.find(line)
+                      if (match != null) {
+                          val candidate = match.groupValues[1].trim()
+                          if (candidate.length >= 3) return candidate
+                      }
+                  }
+                  for (i in lines.indices) {
+                      val upper = lines[i].uppercase()
+                      if (upper == "NAME" && i + 1 < lines.size) return lines[i + 1]
+                      if (upper.contains("FATHER") && i >= 1) {
+                          val prevLine = lines[i - 1]
+                          if (!prevLine.uppercase().contains("INCOME TAX") &&
+                              !prevLine.uppercase().contains("GOVT") &&
+                              prevLine.any { it.isLetter() }
+                          ) {
+                              return prevLine
+                          }
+                      }
+                  }
+                  return "Unknown Member"
+              }
+
+              private fun extractDates(lines: List<String>): Triple<String?, String?, String?> {
+                  var issueDate: String? = null
+                  var expiryDate: String? = null
+                  var dob: String? = null
+
+                  for (line in lines) {
+                      val upper = line.uppercase()
+                      val datesInLine = DATE_REGEX.findAll(line).map { match ->
+                          val (dd, mm, yyyy) = match.destructured
+                          "$yyyy-$mm-$dd"
+                      }.toList()
+                      if (datesInLine.isEmpty()) continue
+                      when {
+                          upper.contains("EXPIR") || upper.contains("VALID TILL") || upper.contains("VALID UPTO") -> expiryDate = datesInLine.last()
+                          upper.contains("DOB") || upper.contains("BIRTH") -> dob = datesInLine.first()
+                          upper.contains("ISSUE") || upper.contains("DATE") -> if (issueDate == null) issueDate = datesInLine.first()
+                      }
+                  }
+                  return Triple(issueDate, expiryDate, dob)
+              }
+
+              private fun buildExtraAttributesJson(upperText: String, lines: List<String>, subType: String, dob: String?): String {
+                  val json = JSONObject()
+                  if (dob != null) json.put("dob", dob)
+                  IFSC_REGEX.find(upperText)?.value?.let { json.put("ifsc", it) }
+                  for (line in lines) {
+                      val fatherMatch = Regex("^(?:FATHER'?S?\\s*NAME|CARE\\s*OF|S/O|D/O|W/O)\\s*[:.-]+\\s*(.+)$", RegexOption.IGNORE_CASE).find(line)
+                      if (fatherMatch != null) json.put("father_or_guardian", fatherMatch.groupValues[1].trim())
+                      val pctMatch = Regex("(?:PERCENTAGE|RESULT|CGPA)\\s*[:.-]+\\s*([0-9.]+%?)", RegexOption.IGNORE_CASE).find(line)
+                      if (pctMatch != null) json.put("score", pctMatch.groupValues[1].trim())
+                  }
+                  json.put("parsed_sub_type", subType)
+                  return json.toString()
+              }
+
+              private fun detectBankAuthority(upperText: String): String {
+                  return when {
+                      upperText.contains("STATE BANK OF INDIA") || upperText.contains("SBIN0") -> "State Bank of India (SBI)"
+                      upperText.contains("CANARA BANK") || upperText.contains("CNRB0") -> "Canara Bank"
+                      upperText.contains("HDFC BANK") || upperText.contains("HDFC0") -> "HDFC Bank"
+                      upperText.contains("ICICI BANK") || upperText.contains("ICIC0") -> "ICICI Bank"
+                      upperText.contains("UNION BANK") || upperText.contains("UBIN0") -> "Union Bank of India"
+                      upperText.contains("KARNATAKA VIKAS") || upperText.contains("KVGB") -> "Karnataka Vikas Grameena Bank"
+                      else -> "Banking Institution"
+                  }
+              }
+
+              fun validateVerhoeffChecksum(digits: String): Boolean {
+                  if (digits.length != 12 || !digits.all { it.isDigit() }) return false
+                  val d = arrayOf(
+                      intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+                      intArrayOf(1, 2, 3, 4, 0, 6, 7, 8, 9, 5),
+                      intArrayOf(2, 3, 4, 0, 1, 7, 8, 9, 5, 6),
+                      intArrayOf(3, 4, 0, 1, 2, 8, 9, 5, 6, 7),
+                      intArrayOf(4, 0, 1, 2, 3, 9, 5, 6, 7, 8),
+                      intArrayOf(5, 9, 8, 7, 6, 0, 4, 3, 2, 1),
+                      intArrayOf(6, 5, 9, 8, 7, 1, 0, 4, 3, 2),
+                      intArrayOf(7, 6, 5, 9, 8, 2, 1, 0, 4, 3),
+                      intArrayOf(8, 7, 6, 5, 9, 3, 2, 1, 0, 4),
+                      intArrayOf(9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+                  )
+                  val p = arrayOf(
+                      intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+                      intArrayOf(1, 5, 7, 6, 2, 8, 3, 0, 9, 4),
+                      intArrayOf(5, 8, 0, 3, 7, 9, 6, 1, 4, 2),
+                      intArrayOf(8, 9, 1, 6, 0, 4, 3, 5, 2, 7),
+                      intArrayOf(9, 4, 5, 3, 1, 2, 6, 8, 7, 0),
+                      intArrayOf(4, 2, 8, 6, 5, 7, 3, 9, 0, 1),
+                      intArrayOf(2, 7, 9, 3, 8, 0, 6, 4, 1, 5),
+                      intArrayOf(7, 0, 4, 6, 9, 1, 3, 2, 5, 8)
+                  )
+                  var c = 0
+                  val reversed = digits.reversed()
+                  for (i in reversed.indices) {
+                      c = d[c][p[i % 8][reversed[i].digitToInt()]]
+                  }
+                  return c == 0
+              }
+          }
+          EOF
+
+          # 8. ScanAndVoiceProcessor.kt (ML Kit Camera + QR + Blur Gate + Voice Formatter)
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/scanner/ScanAndVoiceProcessor.kt
+          package com.familyvault.app.scanner
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import android.os.Build
+          import com.familyvault.app.crypto.VaultCryptoManager
+          import com.familyvault.app.domain.DocumentParserEngine
+          import com.familyvault.app.domain.ParsedDocumentPayload
+          import com.google.android.gms.tasks.Task
+          import com.google.mlkit.vision.barcode.BarcodeScanning
+          import com.google.mlkit.vision.barcode.common.Barcode
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.suspendCancellableCoroutine
+          import kotlinx.coroutines.withContext
+          import java.io.ByteArrayInputStream
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+          import kotlin.coroutines.resume
+          import kotlin.coroutines.resumeWithException
+
+          data class ScanExecutionResult(
+              val parsedPayload: ParsedDocumentPayload,
+              val qualityReport: String,
+              val encryptedFilePath: String,
+              val sha256Hash: String,
+              val qrVerified: Boolean
+          )
+
+          object ScanAndVoiceProcessor {
+
+              suspend fun processScannedDocumentUri(
+                  context: Context,
+                  imageUri: Uri,
+                  cryptoManager: VaultCryptoManager
+              ): ScanExecutionResult = withContext(Dispatchers.IO) {
+                  val appContext = context.applicationContext
+
+                  val bitmap = appContext.contentResolver.openInputStream(imageUri)?.use {
+                      BitmapFactory.decodeStream(it)
+                  } ?: throw IllegalStateException("Unable to read scanned image URI")
+
+                  val qualityReport = evaluateBlurAndGlare(bitmap)
+
+                  val inputImage = InputImage.fromFilePath(appContext, imageUri)
+                  val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                  val barcodeScanner = BarcodeScanning.getClient()
+
+                  val ocrResult = textRecognizer.process(inputImage).awaitTask()
+                  val barcodes: List<Barcode> = try {
+                      barcodeScanner.process(inputImage).awaitTask()
+                  } catch (_: Throwable) {
+                      emptyList()
+                  }
+
+                  val qrExtractedLines = barcodes.mapNotNull { it.rawValue }.map { rawQr ->
+                      normalizeQrPayload(rawQr)
+                  }
+                  val hasQr = qrExtractedLines.isNotEmpty()
+
+                  val combinedRawText = buildString {
+                      if (hasQr) {
+                          appendLine(qrExtractedLines.joinToString("\n"))
+                      }
+                      append(ocrResult.text)
+                  }.trim()
+
+                  val parsed = DocumentParserEngine.parseDocumentText(
+                      combinedRawText.ifEmpty { "General Document\nName : Unknown Member" }
+                  )
+
+                  val webpStream = ByteArrayOutputStream()
+                  val compressFormat = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      Bitmap.CompressFormat.WEBP_LOSSY
+                  } else {
+                      @Suppress("DEPRECATION")
+                      Bitmap.CompressFormat.WEBP
+                  }
+                  bitmap.compress(compressFormat, 88, webpStream)
+                  val webpBytes = webpStream.toByteArray()
+
+                  val vaultDir = File(appContext.filesDir, "vault_encrypted_scans").apply { mkdirs() }
+                  val destFile = File(vaultDir, "scan_${System.currentTimeMillis()}.enc")
+                  val sha256 = cryptoManager.encryptStreamToVaultFile(
+                      inputStream = ByteArrayInputStream(webpBytes),
+                      destinationFile = destFile,
+                      associatedData = "VaultScan_v2"
+                  )
+
+                  ScanExecutionResult(
+                      parsedPayload = parsed,
+                      qualityReport = qualityReport,
+                      encryptedFilePath = destFile.absolutePath,
+                      sha256Hash = sha256,
+                      qrVerified = hasQr
+                  )
+              }
+
+              private fun evaluateBlurAndGlare(bitmap: Bitmap): String {
+                  val scaled = Bitmap.createScaledBitmap(bitmap, 160, 160, true)
+                  val w = scaled.width
+                  val h = scaled.height
+                  val pixels = IntArray(w * h)
+                  scaled.getPixels(pixels, 0, w, 0, 0, w, h)
+
+                  val luma = IntArray(w * h)
+                  var glarePixels = 0
+                  for (i in pixels.indices) {
+                      val p = pixels[i]
+                      val r = (p shr 16) and 0xFF
+                      val g = (p shr 8) and 0xFF
+                      val b = p and 0xFF
+                      val y = (r * 299 + g * 587 + b * 114) / 1000
+                      luma[i] = y
+                      if (y >= 248) glarePixels++
+                  }
+
+                  var laplacianSum = 0.0
+                  var count = 0
+                  for (y in 1 until h - 1) {
+                      for (x in 1 until w - 1) {
+                          val idx = y * w + x
+                          val lap = -4 * luma[idx] + luma[idx - 1] + luma[idx + 1] + luma[idx - w] + luma[idx + w]
+                          laplacianSum += (lap * lap).toDouble()
+                          count++
+                      }
+                  }
+
+                  val sharpnessScore = (laplacianSum / count.coerceAtLeast(1)).toInt()
+                  val glarePct = (glarePixels * 100.0) / pixels.size.coerceAtLeast(1)
+
+                  val focusLabel = if (sharpnessScore >= 180) "Sharp Focus" else "Soft Focus"
+                  val glareLabel = if (glarePct < 12.0) "Low Glare (${"%.1f".format(glarePct)}%)" else "Glare Warning (${"%.1f".format(glarePct)}%)"
+                  return "$focusLabel • $glareLabel"
+              }
+
+              private fun normalizeQrPayload(rawQr: String): String {
+                  val lines = mutableListOf<String>()
+                  Regex("name\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
+                      lines.add("Name : ${it.groupValues[1]}")
+                  }
+                  Regex("dob\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
+                      lines.add("DOB : ${it.groupValues[1]}")
+                  }
+                  if (lines.isEmpty()) lines.add(rawQr)
+                  return lines.joinToString("\n")
+              }
+
+              fun formatVoiceTranscriptForParser(spokenText: String): String {
+                  var normalized = spokenText.trim()
+                  val replacements = listOf(
+                      Regex("\\b(?:person\\s+name|holder\\s+name|member\\s+name|name\\s+is|name)\\b", RegexOption.IGNORE_CASE) to "\nName : ",
+                      Regex("\\b(?:document\\s+type|category\\s+is|category|document)\\b", RegexOption.IGNORE_CASE) to "\nDocument : ",
+                      Regex("\\b(?:document\\s+number|account\\s+number|pan\\s+number|license\\s+number|number\\s+is|number)\\b", RegexOption.IGNORE_CASE) to "\nNumber : ",
+                      Regex("\\b(?:issuing\\s+authority|authority\\s+is|authority|bank\\s+name)\\b", RegexOption.IGNORE_CASE) to "\nAuthority : ",
+                      Regex("\\b(?:expiry\\s+date|valid\\s+till|expires\\s+on|expiry)\\b", RegexOption.IGNORE_CASE) to "\nExpiry Date : ",
+                      Regex("\\b(?:mobile\\s+number|phone\\s+number|mobile)\\b", RegexOption.IGNORE_CASE) to "\nMobile : ",
+                      Regex("\\b(?:ifsc\\s+code|ifsc)\\b", RegexOption.IGNORE_CASE) to "\nIFSC : "
+                  )
+                  for ((pattern, target) in replacements) {
+                      normalized = normalized.replace(pattern, target)
+                  }
+                  normalized = normalized.replace(
+                      Regex("(?<=\\b[A-Z0-9])\\s+(?=[A-Z0-9]\\b)", RegexOption.IGNORE_CASE),
+                      ""
+                  )
+                  return normalized.trim()
+              }
+
+              private suspend fun <T> Task<T>.awaitTask(): T = suspendCancellableCoroutine { cont ->
+                  addOnSuccessListener { result -> if (cont.isActive) cont.resume(result) }
+                  addOnFailureListener { exc -> if (cont.isActive) cont.resumeWithException(exc) }
+                  addOnCanceledListener { if (cont.isActive) cont.cancel() }
+              }
+          }
+          EOF
+
+          # 9. MainActivity.kt (Sprint 3 Camera Scanner + Voice Dictation + Fuzzy Matcher)
+          sed 's/^          //' << 'EOF' > app/src/main/java/com/familyvault/app/MainActivity.kt
+          package com.familyvault.app
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.speech.RecognizerIntent
+          import android.view.WindowManager
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.IntentSenderRequest
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.biometric.BiometricManager
+          import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
+          import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
+          import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+          import androidx.biometric.BiometricPrompt
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.CheckCircle
+          import androidx.compose.material.icons.filled.Lock
+          import androidx.compose.material.icons.filled.Warning
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+          import androidx.fragment.app.FragmentActivity
+          import androidx.lifecycle.lifecycleScope
+          import com.familyvault.app.crypto.VaultCryptoManager
+          import com.familyvault.app.data.local.*
+          import com.familyvault.app.domain.*
+          import com.familyvault.app.scanner.ScanAndVoiceProcessor
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.util.Locale
+
+          class MainActivity : FragmentActivity() {
+
+              private var unlockedDb by mutableStateOf<VaultDatabase?>(null)
+              private var authStatus by mutableStateOf("Vault Locked — Biometric Verification Required")
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.setFlags(
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                      WindowManager.LayoutParams.FLAG_SECURE
+                  )
+
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              val db = unlockedDb
+                              if (db == null) {
+                                  LockedScreen(authStatus) { triggerBiometricPromptSafe() }
+                              } else {
+                                  Sprint3ScannerWorkbench(
+                                      activity = this@MainActivity,
+                                      db = db,
+                                      onLock = {
+                                          VaultDatabase.lockAndCloseDatabase()
+                                          unlockedDb = null
+                                          authStatus = "Vault Locked & RAM Keys Scrubbed"
+                                      }
+                                  )
+                              }
+                          }
+                      }
+                  }
+
+                  window.decorView.postDelayed({
+                      if (!isFinishing && !isDestroyed) triggerBiometricPromptSafe()
+                  }, 250L)
+              }
+
+              private fun triggerBiometricPromptSafe() {
+                  try {
+                      val bm = BiometricManager.from(this)
+                      val strongPin = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
+                      val weakPin = BIOMETRIC_WEAK or DEVICE_CREDENTIAL
+
+                      val builder = BiometricPrompt.PromptInfo.Builder()
+                          .setTitle("Unlock FamilyVault")
+                          .setSubtitle("Verify fingerprint or device PIN")
+
+                      when {
+                          bm.canAuthenticate(strongPin) == BiometricManager.BIOMETRIC_SUCCESS ->
+                              builder.setAllowedAuthenticators(strongPin)
+                          bm.canAuthenticate(weakPin) == BiometricManager.BIOMETRIC_SUCCESS ->
+                              builder.setAllowedAuthenticators(weakPin)
+                          bm.canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS -> {
+                              builder.setAllowedAuthenticators(BIOMETRIC_STRONG)
+                              builder.setNegativeButtonText("Cancel")
+                          }
+                          else -> {
+                              unlockDatabase()
+                              return
+                          }
+                      }
+
+                      val prompt = BiometricPrompt(
+                          this,
+                          ContextCompat.getMainExecutor(this),
+                          object : BiometricPrompt.AuthenticationCallback() {
+                              override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                                  unlockDatabase()
+                              }
+                              override fun onAuthenticationError(code: Int, err: CharSequence) {
+                                  authStatus = "Biometric Locked: $err"
+                              }
+                          }
+                      )
+                      prompt.authenticate(builder.build())
+                  } catch (t: Throwable) {
+                      authStatus = "Auth Error: ${t.localizedMessage}"
+                  }
+              }
+
+              private fun unlockDatabase() {
+                  lifecycleScope.launch(Dispatchers.IO) {
+                      var pass: ByteArray? = null
+                      try {
+                          pass = VaultCryptoManager(applicationContext).getOrCreateDatabasePassphrase()
+                          val db = VaultDatabase.getUnlockedInstance(applicationContext, pass)
+                          db.vaultDao().cleanupSprint1TestProfile()
+                          withContext(Dispatchers.Main) { unlockedDb = db }
+                      } catch (t: Throwable) {
+                          withContext(Dispatchers.Main) { authStatus = "DB Error: ${t.localizedMessage}" }
+                      } finally {
+                          pass?.fill(0)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun LockedScreen(status: String, onUnlock: () -> Unit) {
+              Column(
+                  modifier = Modifier.fillMaxSize().padding(24.dp),
+                  verticalArrangement = Arrangement.Center,
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Icon(Icons.Default.Lock, null, Modifier.size(72.dp), tint = MaterialTheme.colorScheme.primary)
+                  Spacer(Modifier.height(16.dp))
+                  Text("FamilyVault Industrial", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(8.dp))
+                  Text(status, style = MaterialTheme.typography.bodyMedium)
+                  Spacer(Modifier.height(28.dp))
+                  Button(onClick = onUnlock) {
+                      Icon(Icons.Default.Lock, null)
+                      Spacer(Modifier.width(8.dp))
+                      Text("Authenticate with Biometrics")
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          private fun Sprint3ScannerWorkbench(
+              activity: Activity,
+              db: VaultDatabase,
+              onLock: () -> Unit
+          ) {
+              val scope = rememberCoroutineScope()
+              val dao = remember { db.vaultDao() }
+              val cryptoManager = remember { VaultCryptoManager(activity.applicationContext) }
+              val members by dao.observeAllFamilyMembers().collectAsState(initial = emptyList())
+              val docs by dao.observeAllDocuments().collectAsState(initial = emptyList())
+
+              var ocrInput by remember {
+                  mutableStateOf("INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nPermanent Account Number\nABCDE1234F")
+              }
+              var banner by remember { mutableStateOf("Tap 'Scan Document' or 'Voice Input' to capture real data.") }
+              var pendingEncryptedScanPath by remember { mutableStateOf<Pair<String, String>?>(null) }
+              var mismatchState by remember {
+                  mutableStateOf<Pair<NameResolutionResult.MinimalMismatchAlert, ParsedDocumentPayload>?>(null)
+              }
+
+              val scannerLauncher = rememberLauncherForActivityResult(
+                  contract = ActivityResultContracts.StartIntentSenderForResult()
+              ) { result ->
+                  if (result.resultCode == Activity.RESULT_OK) {
+                      val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(result.data)
+                      val firstPageUri = scanResult?.pages?.firstOrNull()?.imageUri
+                      if (firstPageUri != null) {
+                          banner = "Running Blur/Glare Check + Parallel OCR & QR Decoder..."
+                          scope.launch {
+                              try {
+                                  val processed = ScanAndVoiceProcessor.processScannedDocumentUri(
+                                      context = activity,
+                                      imageUri = firstPageUri,
+                                      cryptoManager = cryptoManager
+                                  )
+                                  ocrInput = processed.parsedPayload.rawText
+                                  pendingEncryptedScanPath = Pair(processed.encryptedFilePath, processed.sha256Hash)
+                                  banner = "Scan Encrypted! [${processed.qualityReport}] " +
+                                      (if (processed.qrVerified) "• QR Verified!" else "• OCR Extracted")
+                              } catch (t: Throwable) {
+                                  banner = "Scan Error: ${t.localizedMessage}"
+                              }
+                          }
+                      }
+                  }
+              }
+
+              val voiceLauncher = rememberLauncherForActivityResult(
+                  contract = ActivityResultContracts.StartActivityForResult()
+              ) { result ->
+                  if (result.resultCode == Activity.RESULT_OK) {
+                      val spokenList = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                      val bestTranscript = spokenList?.firstOrNull()
+                      if (!bestTranscript.isNullOrBlank()) {
+                          ocrInput = ScanAndVoiceProcessor.formatVoiceTranscriptForParser(bestTranscript)
+                          banner = "Voice Captured! Review below and tap 'Parse & Route'."
+                      }
+                  }
+              }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text("FamilyVault • Sprint 3 Scanner") },
+                          actions = { TextButton(onClick = onLock) { Text("Lock Vault") } }
+                      )
+                  }
+              ) { pad ->
+                  LazyColumn(
+                      modifier = Modifier.fillMaxSize().padding(pad).padding(16.dp),
+                      verticalArrangement = Arrangement.spacedBy(10.dp)
+                  ) {
+                      item {
+                          Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+                              Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  Icon(Icons.Default.CheckCircle, null, Modifier.size(28.dp))
+                                  Spacer(Modifier.width(10.dp))
+                                  Text(
+                                      "Sprint 3 Active: ML Kit Camera Scanner + QR + Voice Input",
+                                      fontWeight = FontWeight.Bold,
+                                      style = MaterialTheme.typography.bodyMedium
+                                  )
+                              }
+                          }
+                      }
+
+                      item {
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Button(
+                                  onClick = {
+                                      try {
+                                          val options = GmsDocumentScannerOptions.Builder()
+                                              .setGalleryImportAllowed(true)
+                                              .setPageLimit(2)
+                                              .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
+                                              .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                                              .build()
+                                          GmsDocumentScanning.getClient(options)
+                                              .getStartScanIntent(activity)
+                                              .addOnSuccessListener { intentSender ->
+                                                  scannerLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+                                              }
+                                              .addOnFailureListener { e ->
+                                                  banner = "Scanner Init Error: ${e.localizedMessage}"
+                                              }
+                                      } catch (t: Throwable) {
+                                          banner = "Scanner Error: ${t.localizedMessage}"
+                                      }
+                                  },
+                                  modifier = Modifier.weight(1f)
+                              ) { Text("Scan Document") }
+
+                              ElevatedButton(
+                                  onClick = {
+                                      try {
+                                          val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                              putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                              putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                                              putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak: Name, Document, Number, Authority")
+                                          }
+                                          voiceLauncher.launch(intent)
+                                      } catch (t: Throwable) {
+                                          banner = "Voice Input unavailable: ${t.localizedMessage}"
+                                      }
+                                  },
+                                  modifier = Modifier.weight(1f)
+                              ) { Text("Voice Input") }
+                          }
+                      }
+
+                      item {
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              OutlinedButton(
+                                  onClick = {
+                                      ocrInput = "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nPermanent Account Number\nABCDE1234F"
+                                  },
+                                  modifier = Modifier.weight(1f)
+                              ) { Text("1. PAN\n(Exact)", style = MaterialTheme.typography.labelSmall) }
+
+                              OutlinedButton(
+                                  onClick = {
+                                      ocrInput = "STATE BANK OF INDIA\nPASSBOOK\nAccount Holder Name : Mohd Rlyaz\nA/c No : 30948571234\nIFSC : SBIN0040123"
+                                  },
+                                  modifier = Modifier.weight(1f)
+                              ) { Text("2. Bank\n(Typo)", style = MaterialTheme.typography.labelSmall) }
+
+                              OutlinedButton(
+                                  onClick = {
+                                      ocrInput = "UNION OF INDIA\nDRIVING LICENCE\nKA25 20200098765\nName : M. Riyaz\nValid Till : 09/01/2040"
+                                  },
+                                  modifier = Modifier.weight(1f)
+                              ) { Text("3. DL\n(Initial)", style = MaterialTheme.typography.labelSmall) }
+                          }
+                      }
+
+                      item {
+                          OutlinedTextField(
+                              value = ocrInput,
+                              onValueChange = { ocrInput = it },
+                              label = { Text("Extracted OCR / QR / Voice Text (Editable)") },
+                              modifier = Modifier.fillMaxWidth(),
+                              minLines = 4
+                          )
+                      }
+
+                      item {
+                          Button(
+                              onClick = {
+                                  scope.launch(Dispatchers.IO) {
+                                      val parsed = DocumentParserEngine.parseDocumentText(ocrInput)
+                                      val norm = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName)
+                                      val aliasId = dao.findMemberIdByAlias(norm)
+                                      val existing = dao.getAllFamilyMembersOnce()
+                                      val scanAttachment = pendingEncryptedScanPath
+
+                                      when (val res = NameResolutionEngine.resolveIdentity(parsed.extractedName, existing, aliasId)) {
+                                          is NameResolutionResult.ExactOrAliasMatch -> {
+                                              val (docId, msg) = dao.upsertDocumentWithVersionAudit(
+                                                  DocumentEntity(
+                                                      memberId = res.member.memberId,
+                                                      docCategory = parsed.docCategory,
+                                                      docSubType = parsed.docSubType,
+                                                      nameOnDocument = parsed.extractedName,
+                                                      documentNumber = parsed.documentNumber,
+                                                      issuingAuthority = parsed.issuingAuthority,
+                                                      issueDate = parsed.issueDate,
+                                                      expiryDate = parsed.expiryDate,
+                                                      linkedMobile = parsed.linkedMobile,
+                                                      extraAttributesJson = parsed.extraAttributesJson,
+                                                      rawExtractedText = parsed.rawText,
+                                                      extractionSource = if (scanAttachment != null) "CAMERA_SCAN" else "TEXT_OR_VOICE"
+                                                  )
+                                              )
+                                              if (scanAttachment != null) {
+                                                  dao.insertAttachment(
+                                                      DocumentAttachmentEntity(
+                                                          docId = docId,
+                                                          pageOrder = 1,
+                                                          fileRole = "SCAN_WEBP",
+                                                          tinkEncryptedPath = scanAttachment.first,
+                                                          sha256Hash = scanAttachment.second
+                                                      )
+                                                  )
+                                                  pendingEncryptedScanPath = null
+                                              }
+                                              withContext(Dispatchers.Main) {
+                                                  banner = "Routed to '${res.member.canonicalName}' • $msg"
+                                              }
+                                          }
+                                          is NameResolutionResult.MinimalMismatchAlert -> {
+                                              withContext(Dispatchers.Main) { mismatchState = Pair(res, parsed) }
+                                          }
+                                          is NameResolutionResult.NewMemberDetected -> {
+                                              val newId = dao.insertFamilyMember(
+                                                  FamilyMemberEntity(
+                                                      canonicalName = res.cleanedDisplayName,
+                                                      sortedTokens = res.sortedTokens,
+                                                      phoneticPrimary = res.phoneticCode,
+                                                      relationshipRole = "Family Member"
+                                                  )
+                                              )
+                                              val (docId, msg) = dao.upsertDocumentWithVersionAudit(
+                                                  DocumentEntity(
+                                                      memberId = newId,
+                                                      docCategory = parsed.docCategory,
+                                                      docSubType = parsed.docSubType,
+                                                      nameOnDocument = parsed.extractedName,
+                                                      documentNumber = parsed.documentNumber,
+                                                      issuingAuthority = parsed.issuingAuthority,
+                                                      issueDate = parsed.issueDate,
+                                                      expiryDate = parsed.expiryDate,
+                                                      linkedMobile = parsed.linkedMobile,
+                                                      extraAttributesJson = parsed.extraAttributesJson,
+                                                      rawExtractedText = parsed.rawText,
+                                                      extractionSource = if (scanAttachment != null) "CAMERA_SCAN" else "TEXT_OR_VOICE"
+                                                  )
+                                              )
+                                              if (scanAttachment != null) {
+                                                  dao.insertAttachment(
+                                                      DocumentAttachmentEntity(
+                                                          docId = docId,
+                                                          pageOrder = 1,
+                                                          fileRole = "SCAN_WEBP",
+                                                          tinkEncryptedPath = scanAttachment.first,
+                                                          sha256Hash = scanAttachment.second
+                                                      )
+                                                  )
+                                                  pendingEncryptedScanPath = null
+                                              }
+                                              withContext(Dispatchers.Main) {
+                                                  banner = "Created Profile '${res.cleanedDisplayName}' • $msg"
+                                              }
+                                          }
+                                      }
+                                  }
+                              },
+                              modifier = Modifier.fillMaxWidth()
+                          ) { Text("Parse Columns & Route to Database") }
+                      }
+
+                      item {
+                          Text(banner, color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodyMedium)
+                          HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                          Text("Profiles (${members.size}) • Documents (${docs.size})", fontWeight = FontWeight.Bold)
+                      }
+
+                      items(members) { m ->
+                          val mDocs = docs.filter { it.memberId == m.memberId }
+                          OutlinedCard(Modifier.fillMaxWidth()) {
+                              Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                  Text("👤 ${m.canonicalName} (Phonetic: ${m.phoneticPrimary})", fontWeight = FontWeight.Bold)
+                                  mDocs.forEach { d ->
+                                      Text(
+                                          "📄 ${d.docSubType} (v${d.versionNumber}) | No: ${d.documentNumber} | ${d.issuingAuthority}",
+                                          style = MaterialTheme.typography.bodySmall
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              val alert = mismatchState
+              if (alert != null) {
+                  val (mismatch, parsed) = alert
+                  AlertDialog(
+                      onDismissRequest = { mismatchState = null },
+                      icon = { Icon(Icons.Default.Warning, null) },
+                      title = { Text("Spelling / Initial Mismatch") },
+                      text = {
+                          Text(
+                              "Scanned: '${mismatch.extractedRawName}'\n" +
+                                  "Matches Existing: '${mismatch.candidateMember.canonicalName}'\n" +
+                                  "Reason: ${mismatch.matchReason} (${(mismatch.similarityScore * 100).toInt()}%)"
+                          )
+                      },
+                      confirmButton = {
+                          Button(onClick = {
+                              mismatchState = null
+                              scope.launch(Dispatchers.IO) {
+                                  dao.insertAlias(
+                                      MemberAliasEntity(
+                                          memberId = mismatch.candidateMember.memberId,
+                                          aliasNormalized = mismatch.normalizedAliasToSave
+                                      )
+                                  )
+                                  val (_, msg) = dao.upsertDocumentWithVersionAudit(
+                                      DocumentEntity(
+                                          memberId = mismatch.candidateMember.memberId,
+                                          docCategory = parsed.docCategory,
+                                          docSubType = parsed.docSubType,
+                                          nameOnDocument = parsed.extractedName,
+                                          documentNumber = parsed.documentNumber,
+                                          issuingAuthority = parsed.issuingAuthority,
+                                          issueDate = parsed.issueDate,
+                                          expiryDate = parsed.expiryDate,
+                                          linkedMobile = parsed.linkedMobile,
+                                          extraAttributesJson = parsed.extraAttributesJson,
+                                          rawExtractedText = parsed.rawText,
+                                          extractionSource = "ALIAS_MERGED"
+                                      )
+                                  )
+                                  withContext(Dispatchers.Main) {
+                                      banner = "Merged into '${mismatch.candidateMember.canonicalName}' & Alias Saved! ($msg)"
+                                  }
+                              }
+                          }) { Text("Move to Existing") }
+                      },
+                      dismissButton = {
+                          OutlinedButton(onClick = {
+                              mismatchState = null
+                              scope.launch(Dispatchers.IO) {
+                                  val id = dao.insertFamilyMember(
+                                      FamilyMemberEntity(
+                                          canonicalName = mismatch.extractedRawName,
+                                          sortedTokens = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName),
+                                          phoneticPrimary = NameResolutionEngine.computePhoneticSignature(parsed.extractedName),
+                                          relationshipRole = "Family Member"
+                                      )
+                                  )
+                                  dao.upsertDocumentWithVersionAudit(
+                                      DocumentEntity(
+                                          memberId = id,
+                                          docCategory = parsed.docCategory,
+                                          docSubType = parsed.docSubType,
+                                          nameOnDocument = parsed.extractedName,
+                                          documentNumber = parsed.documentNumber,
+                                          issuingAuthority = parsed.issuingAuthority,
+                                          issueDate = parsed.issueDate,
+                                          expiryDate = parsed.expiryDate,
+                                          linkedMobile = parsed.linkedMobile,
+                                          extraAttributesJson = parsed.extraAttributesJson,
+                                          rawExtractedText = parsed.rawText,
+                                          extractionSource = "NEW_PROFILE"
+                                      )
+                                  )
+                                  withContext(Dispatchers.Main) {
+                                      banner = "Created Separate Profile '${mismatch.extractedRawName}'"
+                                  }
+                              }
+                          }) { Text("Create New") }
+                      }
+                  )
+              }
+          }
+          EOF
+
+          # 10. app/build.gradle.kts + Root Gradle files
+          sed 's/^          //' << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("com.google.devtools.ksp")
+          }
+          android {
+              namespace = "com.familyvault.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.familyvault.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 7
+                  versionName = "0.3.0-sprint3"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging {
+                  resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+                  jniLibs { useLegacyPackaging = true }
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.fragment:fragment-ktx:1.8.2")
+              implementation("androidx.activity:activity-compose:1.9.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
+              implementation("androidx.biometric:biometric:1.1.0")
+
+              val roomVersion = "2.6.1"
+              implementation("androidx.room:room-runtime:$roomVersion")
+              implementation("androidx.room:room-ktx:$roomVersion")
+              ksp("androidx.room:room-compiler:$roomVersion")
+              implementation("net.zetetic:sqlcipher-android:4.6.1@aar")
+              implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+
+              implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+              val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+              implementation(composeBom)
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+          }
+          EOF
+
+          sed 's/^          //' << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FamilyVault"
+          include(":app")
+          EOF
+
+          sed 's/^          //' << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+              id("com.google.devtools.ksp") version "2.0.21-1.0.27" apply false
+          }
+          EOF
+
+          sed 's/^          //' << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+      - name: 4. Sync Cleaned Source Tree Back to GitHub Repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: auto-clean spaced folders and sync Sprint 3 source tree [skip ci]"
+            git push || true
+          fi
+
+      - name: 5. Security Gate - Verify Zero Internet Permission
+        run: |
+          if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
+            echo "❌ SECURITY VIOLATION: INTERNET permission found!"
+            exit 1
+          fi
+
+      - name: 6. Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 7. Ensure Persistent Debug Keystore Exists
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: 8. Accept Pre-Installed Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+
+      - name: 9. Install Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: 10. Compile Debug APK
+        run: gradle assembleDebug --no-daemon --console=plain
+
+      - name: 11. Audit APK Bytecode
+        run: |
+          for cls in "MainActivity.class" "NameResolutionEngine.class" "DocumentParserEngine.class" "ScanAndVoiceProcessor.class"; do
+            if ! find app/build -name "$cls" | grep -q "$cls"; then
+              echo "❌ FATAL: $cls was NOT compiled!"
+              exit 1
+            fi
+          done
+          echo "✅ Sprint 3 Bytecode Audit Passed!"
+
+      - name: 12. Upload Compiled APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FamilyVault-Sprint3-v0.3.0-ScannerAndVoice
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
