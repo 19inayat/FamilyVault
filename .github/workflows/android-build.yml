@@ -1,4 +1,4 @@
-name: Sprint 2 - FamilyVault Parser & Fuzzy Engine Build
+name: Sprint 3 - FamilyVault Scanner, QR & Voice Build
 
 on:
   push:
@@ -15,7 +15,13 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Rescue Files & Auto-Repair Any Mobile Copy-Paste Truncation
+      - name: 2. Cache Persistent Debug Keystore (Prevents Uninstall on Update)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: familyvault-persistent-debug-keystore-v1
+
+      - name: 3. Rescue Files & Verify Balanced Syntax
         run: |
           python3 - << 'EOF'
           import os, shutil
@@ -27,7 +33,8 @@ jobs:
               "VaultDao.kt": "app/src/main/java/com/familyvault/app/data/local/VaultDao.kt",
               "VaultDatabase.kt": "app/src/main/java/com/familyvault/app/data/local/VaultDatabase.kt",
               "NameResolutionEngine.kt": "app/src/main/java/com/familyvault/app/domain/NameResolutionEngine.kt",
-              "DocumentParserEngine.kt": "app/src/main/java/com/familyvault/app/domain/DocumentParserEngine.kt"
+              "DocumentParserEngine.kt": "app/src/main/java/com/familyvault/app/domain/DocumentParserEngine.kt",
+              "ScanAndVoiceProcessor.kt": "app/src/main/java/com/familyvault/app/scanner/ScanAndVoiceProcessor.kt"
           }
 
           rescued = {}
@@ -50,124 +57,22 @@ jobs:
           os.makedirs("app/src/main/java/com/familyvault/app/crypto", exist_ok=True)
           os.makedirs("app/src/main/java/com/familyvault/app/data/local", exist_ok=True)
           os.makedirs("app/src/main/java/com/familyvault/app/domain", exist_ok=True)
+          os.makedirs("app/src/main/java/com/familyvault/app/scanner", exist_ok=True)
 
           for fname, dest in target_files.items():
               if fname in rescued:
                   text = rescued[fname].decode("utf-8", errors="ignore")
-                  # Verify balanced braces and parentheses
                   if text.count("{") == text.count("}") and text.count("(") == text.count(")"):
                       with open(dest, "w", encoding="utf-8") as out:
                           out.write(text)
                       print(f"Verified balanced syntax -> {dest}")
                   else:
-                      print(f"⚠️ Truncated braces detected in {fname}! Will auto-repair in Step 3.")
+                      print(f"❌ Syntax mismatch in {fname}!")
+                      exit(1)
           EOF
 
-      - name: 3. Enforce Complete Sprint 2 Files & Gradle Config
+      - name: 4. Enforce Sprint 3 Manifest & Gradle Config (With ML Kit)
         run: |
-          # Always enforce clean VaultDao.kt
-          cat << 'EOF' > app/src/main/java/com/familyvault/app/data/local/VaultDao.kt
-          package com.familyvault.app.data.local
-
-          import androidx.room.Dao
-          import androidx.room.Insert
-          import androidx.room.OnConflictStrategy
-          import androidx.room.Query
-          import androidx.room.RawQuery
-          import androidx.room.Update
-          import androidx.sqlite.db.SimpleSQLiteQuery
-          import androidx.sqlite.db.SupportSQLiteQuery
-          import kotlinx.coroutines.flow.Flow
-
-          @Dao
-          interface VaultDao {
-              @Insert(onConflict = OnConflictStrategy.ABORT)
-              suspend fun insertFamilyMember(member: FamilyMemberEntity): Long
-
-              @Insert(onConflict = OnConflictStrategy.IGNORE)
-              suspend fun insertAlias(alias: MemberAliasEntity): Long
-
-              @Query("SELECT * FROM family_members ORDER BY canonical_name ASC")
-              fun observeAllFamilyMembers(): Flow<List<FamilyMemberEntity>>
-
-              @Query("SELECT * FROM family_members")
-              suspend fun getAllFamilyMembersOnce(): List<FamilyMemberEntity>
-
-              @Query("SELECT member_id FROM member_aliases WHERE alias_normalized = :normalizedAlias LIMIT 1")
-              suspend fun findMemberIdByAlias(normalizedAlias: String): Long?
-
-              @Query("SELECT * FROM documents ORDER BY updated_at DESC")
-              fun observeAllDocuments(): Flow<List<DocumentEntity>>
-
-              @Query("SELECT * FROM documents WHERE member_id = :memberId AND doc_sub_type = :subType LIMIT 1")
-              suspend fun findExistingDocumentBySubType(memberId: Long, subType: String): DocumentEntity?
-
-              @Insert(onConflict = OnConflictStrategy.REPLACE)
-              suspend fun insertDocument(document: DocumentEntity): Long
-
-              @Update
-              suspend fun updateDocument(document: DocumentEntity)
-
-              @Insert(onConflict = OnConflictStrategy.IGNORE)
-              suspend fun insertAttachment(attachment: DocumentAttachmentEntity): Long
-
-              @Insert(onConflict = OnConflictStrategy.REPLACE)
-              suspend fun insertDocumentHistory(history: DocumentHistoryEntity): Long
-
-              @Query("SELECT * FROM documents WHERE member_id = :memberId ORDER BY doc_category, doc_sub_type")
-              fun observeDocumentsForMember(memberId: Long): Flow<List<DocumentEntity>>
-
-              @Query("DELETE FROM family_members WHERE canonical_name = 'Self Profile (Test)'")
-              suspend fun cleanupSprint1TestProfile()
-
-              @RawQuery(observedEntities = [DocumentEntity::class])
-              suspend fun executeRawDocumentSearch(query: SupportSQLiteQuery): List<DocumentEntity>
-          }
-
-          suspend fun VaultDao.upsertDocumentWithVersionAudit(incoming: DocumentEntity): Pair<Long, String> {
-              val existing = findExistingDocumentBySubType(incoming.memberId, incoming.docSubType)
-              if (existing == null) {
-                  val id = insertDocument(incoming)
-                  return Pair(id, "Inserted v1 (${incoming.docSubType})")
-              }
-              return if (existing.documentNumber.equals(incoming.documentNumber, ignoreCase = true)) {
-                  val updated = incoming.copy(
-                      docId = existing.docId,
-                      versionNumber = existing.versionNumber,
-                      updatedAt = System.currentTimeMillis()
-                  )
-                  updateDocument(updated)
-                  Pair(existing.docId, "Updated existing ${incoming.docSubType}")
-              } else {
-                  insertDocumentHistory(
-                      DocumentHistoryEntity(
-                          docId = existing.docId,
-                          versionNumber = existing.versionNumber,
-                          oldDocumentNumber = existing.documentNumber,
-                          oldIssueDate = existing.issueDate,
-                          oldExpiryDate = existing.expiryDate,
-                          oldEncryptedPath = "vault_archive_v${existing.versionNumber}"
-                      )
-                  )
-                  val newVersion = existing.versionNumber + 1
-                  updateDocument(incoming.copy(docId = existing.docId, versionNumber = newVersion, updatedAt = System.currentTimeMillis()))
-                  Pair(existing.docId, "Archived v${existing.versionNumber} & Upgraded to v$newVersion")
-              }
-          }
-
-          suspend fun VaultDao.searchDocumentsFts5(searchTerm: String): List<DocumentEntity> {
-              val sanitized = searchTerm.replace("\"", "\"\"").trim()
-              if (sanitized.isEmpty()) return emptyList()
-              return try {
-                  val sql = "SELECT d.* FROM documents d INNER JOIN documents_fts fts ON d.doc_id = fts.rowid WHERE documents_fts MATCH '\"$sanitized\"' ORDER BY d.updated_at DESC"
-                  executeRawDocumentSearch(SimpleSQLiteQuery(sql))
-              } catch (_: Throwable) {
-                  val fallbackSql = "SELECT * FROM documents WHERE raw_extracted_text LIKE '%$sanitized%' OR document_number LIKE '%$sanitized%' ORDER BY updated_at DESC"
-                  executeRawDocumentSearch(SimpleSQLiteQuery(fallbackSql))
-              }
-          }
-          EOF
-
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -206,8 +111,8 @@ jobs:
                   applicationId = "com.familyvault.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 6
-                  versionName = "0.2.1-sprint2"
+                  versionCode = 7
+                  versionName = "0.3.0-sprint3"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -228,13 +133,21 @@ jobs:
               implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
               implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
               implementation("androidx.biometric:biometric:1.1.0")
+
               val roomVersion = "2.6.1"
               implementation("androidx.room:room-runtime:$roomVersion")
               implementation("androidx.room:room-ktx:$roomVersion")
               ksp("androidx.room:room-compiler:$roomVersion")
               implementation("net.zetetic:sqlcipher-android:4.6.1@aar")
               implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+
+              // Sprint 3: On-Device ML Kit Document Scanner, Text OCR v2 & QR Barcode
+              implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
               val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
               implementation(composeBom)
               implementation("androidx.compose.ui:ui")
@@ -279,44 +192,55 @@ jobs:
           kotlin.code.style=official
           EOF
 
-      - name: 4. Security Gate - Verify Zero Internet Permission
+      - name: 5. Security Gate - Verify Zero Internet Permission
         run: |
           if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
             echo "❌ SECURITY VIOLATION: INTERNET permission found!"
             exit 1
           fi
 
-      - name: 5. Set up JDK 17
+      - name: 6. Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 6. Accept Pre-Installed Android SDK Licenses
+      - name: 7. Ensure Persistent Debug Keystore Exists
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: 8. Accept Pre-Installed Android SDK Licenses
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
 
-      - name: 7. Install Gradle 8.10.2
+      - name: 9. Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: 8. Compile Debug APK (Clean Console Output)
+      - name: 10. Compile Debug APK
         run: gradle assembleDebug --no-daemon --console=plain
 
-      - name: 9. Audit APK Bytecode
+      - name: 11. Audit APK Bytecode
         run: |
-          for cls in "MainActivity.class" "NameResolutionEngine.class" "DocumentParserEngine.class"; do
+          for cls in "MainActivity.class" "NameResolutionEngine.class" "DocumentParserEngine.class" "ScanAndVoiceProcessor.class"; do
             if ! find app/build -name "$cls" | grep -q "$cls"; then
               echo "❌ FATAL: $cls was NOT compiled!"
               exit 1
             fi
           done
-          echo "✅ Sprint 2 Bytecode Audit Passed!"
+          echo "✅ Sprint 3 Bytecode Audit Passed!"
 
-      - name: 10. Upload Compiled APK Artifact
+      - name: 12. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FamilyVault-Sprint2-v0.2.1-Verified
+          name: FamilyVault-Sprint3-v0.3.0-ScannerAndVoice
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
