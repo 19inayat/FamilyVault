@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Hardware Biometrics Only - ZERO Internet Permission -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
     <application
@@ -11,7 +10,7 @@
         android:icon="@android:drawable/ic_lock_lock"
         android:label="FamilyVault"
         android:supportsRtl="true"
-        android:extractNativeLibs="false"
+        android:extractNativeLibs="true"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
         <activity
@@ -24,5 +23,4 @@
             </intent-filter>
         </activity>
     </application>
-
 </manifest>
