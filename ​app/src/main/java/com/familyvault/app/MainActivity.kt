@@ -11,8 +11,6 @@ import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Lock
@@ -28,10 +26,7 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import com.familyvault.app.crypto.VaultCryptoManager
 import com.familyvault.app.data.local.*
-import com.familyvault.app.domain.DocumentParserEngine
-import com.familyvault.app.domain.NameResolutionEngine
-import com.familyvault.app.domain.NameResolutionResult
-import com.familyvault.app.domain.ParsedDocumentPayload
+import com.familyvault.app.domain.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -39,20 +34,10 @@ import kotlinx.coroutines.withContext
 class MainActivity : FragmentActivity() {
 
     private var unlockedDb by mutableStateOf<VaultDatabase?>(null)
-    private var authStatusMessage by mutableStateOf("Vault Locked — Biometric Verification Required")
-    private var fatalDiagnosticLog by mutableStateOf<String?>(null)
+    private var authStatus by mutableStateOf("Vault Locked — Biometric Verification Required")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            runOnUiThread {
-                fatalDiagnosticLog = "Thread: ${thread.name}\n" +
-                    "Error: ${throwable.javaClass.simpleName}: ${throwable.localizedMessage}\n\n" +
-                    throwable.stackTraceToString().take(1500)
-            }
-        }
-
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE,
             WindowManager.LayoutParams.FLAG_SECURE
@@ -61,31 +46,14 @@ class MainActivity : FragmentActivity() {
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    val crashLog = fatalDiagnosticLog
-                    val currentDb = unlockedDb
-
-                    when {
-                        crashLog != null -> {
-                            DiagnosticErrorScreen(
-                                log = crashLog,
-                                onDismiss = { fatalDiagnosticLog = null }
-                            )
-                        }
-                        currentDb == null -> {
-                            LockedVaultScreen(
-                                statusMessage = authStatusMessage,
-                                onUnlockRequest = { triggerBiometricPromptSafe() }
-                            )
-                        }
-                        else -> {
-                            Sprint2ParserWorkbenchScreen(
-                                db = currentDb,
-                                onLockVault = {
-                                    VaultDatabase.lockAndCloseDatabase()
-                                    unlockedDb = null
-                                    authStatusMessage = "Vault Locked & RAM Keys Scrubbed"
-                                }
-                            )
+                    val db = unlockedDb
+                    if (db == null) {
+                        LockedScreen(authStatus) { triggerBiometricPromptSafe() }
+                    } else {
+                        Sprint2Workbench(db) {
+                            VaultDatabase.lockAndCloseDatabase()
+                            unlockedDb = null
+                            authStatus = "Vault Locked & RAM Keys Scrubbed"
                         }
                     }
                 }
@@ -93,149 +61,86 @@ class MainActivity : FragmentActivity() {
         }
 
         window.decorView.postDelayed({
-            if (!isFinishing && !isDestroyed) {
-                triggerBiometricPromptSafe()
-            }
+            if (!isFinishing && !isDestroyed) triggerBiometricPromptSafe()
         }, 250L)
     }
 
     private fun triggerBiometricPromptSafe() {
         try {
-            val biometricManager = BiometricManager.from(this)
-            val strongOrPin = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
-            val weakOrPin = BIOMETRIC_WEAK or DEVICE_CREDENTIAL
+            val bm = BiometricManager.from(this)
+            val strongPin = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
+            val weakPin = BIOMETRIC_WEAK or DEVICE_CREDENTIAL
 
-            val promptBuilder = BiometricPrompt.PromptInfo.Builder()
+            val builder = BiometricPrompt.PromptInfo.Builder()
                 .setTitle("Unlock FamilyVault")
                 .setSubtitle("Verify fingerprint or device PIN")
 
             when {
-                biometricManager.canAuthenticate(strongOrPin) == BiometricManager.BIOMETRIC_SUCCESS -> {
-                    promptBuilder.setAllowedAuthenticators(strongOrPin)
-                }
-                biometricManager.canAuthenticate(weakOrPin) == BiometricManager.BIOMETRIC_SUCCESS -> {
-                    promptBuilder.setAllowedAuthenticators(weakOrPin)
-                }
-                biometricManager.canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS -> {
-                    promptBuilder.setAllowedAuthenticators(BIOMETRIC_STRONG)
-                    promptBuilder.setNegativeButtonText("Cancel")
+                bm.canAuthenticate(strongPin) == BiometricManager.BIOMETRIC_SUCCESS ->
+                    builder.setAllowedAuthenticators(strongPin)
+                bm.canAuthenticate(weakPin) == BiometricManager.BIOMETRIC_SUCCESS ->
+                    builder.setAllowedAuthenticators(weakPin)
+                bm.canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS -> {
+                    builder.setAllowedAuthenticators(BIOMETRIC_STRONG)
+                    builder.setNegativeButtonText("Cancel")
                 }
                 else -> {
-                    unlockSqlCipherDatabase()
+                    unlockDatabase()
                     return
                 }
             }
 
-            val executor = ContextCompat.getMainExecutor(this)
-            val biometricPrompt = BiometricPrompt(
+            val prompt = BiometricPrompt(
                 this,
-                executor,
+                ContextCompat.getMainExecutor(this),
                 object : BiometricPrompt.AuthenticationCallback() {
                     override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                        super.onAuthenticationSucceeded(result)
-                        unlockSqlCipherDatabase()
+                        unlockDatabase()
                     }
-
-                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                        super.onAuthenticationError(errorCode, errString)
-                        authStatusMessage = "Biometric Locked: $errString"
-                    }
-
-                    override fun onAuthenticationFailed() {
-                        super.onAuthenticationFailed()
-                        authStatusMessage = "Fingerprint not recognized. Try again."
+                    override fun onAuthenticationError(code: Int, err: CharSequence) {
+                        authStatus = "Biometric Locked: $err"
                     }
                 }
             )
-            biometricPrompt.authenticate(promptBuilder.build())
+            prompt.authenticate(builder.build())
         } catch (t: Throwable) {
-            authStatusMessage = "Biometric Error: ${t.localizedMessage}"
+            authStatus = "Auth Error: ${t.localizedMessage}"
         }
     }
 
-    private fun unlockSqlCipherDatabase() {
-        authStatusMessage = "Decrypting SQLCipher 256-bit Vault..."
+    private fun unlockDatabase() {
         lifecycleScope.launch(Dispatchers.IO) {
-            var passphraseBytes: ByteArray? = null
+            var pass: ByteArray? = null
             try {
-                val crypto = VaultCryptoManager(applicationContext)
-                passphraseBytes = crypto.getOrCreateDatabasePassphrase()
-                val db = VaultDatabase.getUnlockedInstance(applicationContext, passphraseBytes)
-                // Clean up Sprint 1 dummy test profile automatically
+                pass = VaultCryptoManager(applicationContext).getOrCreateDatabasePassphrase()
+                val db = VaultDatabase.getUnlockedInstance(applicationContext, pass)
                 db.vaultDao().cleanupSprint1TestProfile()
-                withContext(Dispatchers.Main) {
-                    unlockedDb = db
-                }
+                withContext(Dispatchers.Main) { unlockedDb = db }
             } catch (t: Throwable) {
-                withContext(Dispatchers.Main) {
-                    fatalDiagnosticLog = "Vault Decryption Error:\n${t.stackTraceToString().take(1200)}"
-                }
+                withContext(Dispatchers.Main) { authStatus = "DB Error: ${t.localizedMessage}" }
             } finally {
-                passphraseBytes?.fill(0)
+                pass?.fill(0)
             }
         }
     }
 }
 
 @Composable
-private fun DiagnosticErrorScreen(log: String, onDismiss: () -> Unit) {
+private fun LockedScreen(status: String, onUnlock: () -> Unit) {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(20.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Text(
-            text = "On-Screen Diagnostic Report",
-            style = MaterialTheme.typography.titleLarge,
-            color = MaterialTheme.colorScheme.error,
-            fontWeight = FontWeight.Bold
-        )
-        Text(text = log, style = MaterialTheme.typography.bodySmall)
-        Button(onClick = onDismiss) {
-            Text("Return to Lock Screen")
-        }
-    }
-}
-
-@Composable
-private fun LockedVaultScreen(
-    statusMessage: String,
-    onUnlockRequest: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
+        modifier = Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Icon(
-            imageVector = Icons.Default.Lock,
-            contentDescription = "Locked",
-            modifier = Modifier.size(72.dp),
-            tint = MaterialTheme.colorScheme.primary
-        )
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(
-            text = "FamilyVault Industrial",
-            style = MaterialTheme.typography.headlineMedium,
-            fontWeight = FontWeight.Bold
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = statusMessage,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(modifier = Modifier.height(28.dp))
-        Button(
-            onClick = onUnlockRequest,
-            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 14.dp)
-        ) {
-            Icon(Icons.Default.Lock, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
+        Icon(Icons.Default.Lock, null, Modifier.size(72.dp), tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(16.dp))
+        Text("FamilyVault Industrial", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        Text(status, style = MaterialTheme.typography.bodyMedium)
+        Spacer(Modifier.height(28.dp))
+        Button(onClick = onUnlock) {
+            Icon(Icons.Default.Lock, null)
+            Spacer(Modifier.width(8.dp))
             Text("Authenticate with Biometrics")
         }
     }
@@ -243,26 +148,17 @@ private fun LockedVaultScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Sprint2ParserWorkbenchScreen(
-    db: VaultDatabase,
-    onLockVault: () -> Unit
-) {
+private fun Sprint2Workbench(db: VaultDatabase, onLock: () -> Unit) {
     val scope = rememberCoroutineScope()
     val dao = remember { db.vaultDao() }
     val members by dao.observeAllFamilyMembers().collectAsState(initial = emptyList())
-    val allDocs by dao.observeAllDocuments().collectAsState(initial = emptyList())
+    val docs by dao.observeAllDocuments().collectAsState(initial = emptyList())
 
-    var rawOcrInput by remember {
-        mutableStateOf(
-            "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nFather's Name : Abdul Karim\nDOB : 14/05/1992\nPermanent Account Number\nABCDE1234F"
-        )
+    var ocrInput by remember {
+        mutableStateOf("INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nFather's Name : Abdul Karim\nDOB : 14/05/1992\nPermanent Account Number\nABCDE1234F")
     }
-    var statusBanner by remember {
-        mutableStateOf("Select a preset scan below or edit text, then tap 'Parse & Route to Database'.")
-    }
-
-    // State for Fuzzy Mismatch Alert Dialog
-    var pendingMismatchAlert by remember {
+    var banner by remember { mutableStateOf("Select a preset below and tap 'Parse & Route to Database'.") }
+    var mismatchState by remember {
         mutableStateOf<Pair<NameResolutionResult.MinimalMismatchAlert, ParsedDocumentPayload>?>(null)
     }
 
@@ -270,182 +166,226 @@ private fun Sprint2ParserWorkbenchScreen(
         topBar = {
             TopAppBar(
                 title = { Text("FamilyVault • Sprint 2 Engine") },
-                actions = {
-                    TextButton(onClick = onLockVault) {
-                        Text("Lock Vault")
-                    }
-                }
+                actions = { TextButton(onClick = onLock) { Text("Lock Vault") } }
             )
         }
-    ) { padding ->
+    ) { pad ->
         LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            modifier = Modifier.fillMaxSize().padding(pad).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    )
-                ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = null,
-                            modifier = Modifier.size(32.dp)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Column {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CheckCircle, null, Modifier.size(28.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Text("Sprint 2 Active: OCR Column Segregation & Fuzzy Name Matcher", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            ocrInput = "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nFather's Name : Abdul Karim\nDOB : 14/05/1992\nPermanent Account Number\nABCDE1234F"
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("1. PAN\n(Exact)", style = MaterialTheme.typography.labelSmall) }
+
+                    OutlinedButton(
+                        onClick = {
+                            ocrInput = "STATE BANK OF INDIA\nPASSBOOK\nAccount Holder Name : Mohd Rlyaz\nA/c No : 30948571234\nIFSC : SBIN0040123\nMobile : 9876543210"
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("2. Bank\n(Typo)", style = MaterialTheme.typography.labelSmall) }
+
+                    OutlinedButton(
+                        onClick = {
+                            ocrInput = "UNION OF INDIA\nDRIVING LICENCE\nKA25 20200098765\nName : M. Riyaz\nIssue Date : 10/01/2020\nValid Till : 09/01/2040"
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("3. DL\n(Initial)", style = MaterialTheme.typography.labelSmall) }
+                }
+            }
+            item {
+                OutlinedTextField(
+                    value = ocrInput,
+                    onValueChange = { ocrInput = it },
+                    label = { Text("Simulated OCR / Voice Input") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 4
+                )
+            }
+            item {
+                Button(
+                    onClick = {
+                        scope.launch(Dispatchers.IO) {
+                            val parsed = DocumentParserEngine.parseDocumentText(ocrInput)
+                            val norm = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName)
+                            val aliasId = dao.findMemberIdByAlias(norm)
+                            val existing = dao.getAllFamilyMembersOnce()
+                            when (val res = NameResolutionEngine.resolveIdentity(parsed.extractedName, existing, aliasId)) {
+                                is NameResolutionResult.ExactOrAliasMatch -> {
+                                    val (_, msg) = dao.upsertDocumentWithVersionAudit(
+                                        DocumentEntity(
+                                            memberId = res.member.memberId,
+                                            docCategory = parsed.docCategory,
+                                            docSubType = parsed.docSubType,
+                                            nameOnDocument = parsed.extractedName,
+                                            documentNumber = parsed.documentNumber,
+                                            issuingAuthority = parsed.issuingAuthority,
+                                            issueDate = parsed.issueDate,
+                                            expiryDate = parsed.expiryDate,
+                                            linkedMobile = parsed.linkedMobile,
+                                            extraAttributesJson = parsed.extraAttributesJson,
+                                            rawExtractedText = parsed.rawText,
+                                            extractionSource = "SPRINT2_PARSER"
+                                        )
+                                    )
+                                    withContext(Dispatchers.Main) {
+                                        banner = "✅ Routed to '${res.member.canonicalName}' (${res.matchedVia}) • $msg"
+                                    }
+                                }
+                                is NameResolutionResult.MinimalMismatchAlert -> {
+                                    withContext(Dispatchers.Main) { mismatchState = Pair(res, parsed) }
+                                }
+                                is NameResolutionResult.NewMemberDetected -> {
+                                    val newId = dao.insertFamilyMember(
+                                        FamilyMemberEntity(
+                                            canonicalName = res.cleanedDisplayName,
+                                            sortedTokens = res.sortedTokens,
+                                            phoneticPrimary = res.phoneticCode,
+                                            relationshipRole = "Family Member"
+                                        )
+                                    )
+                                    val (_, msg) = dao.upsertDocumentWithVersionAudit(
+                                        DocumentEntity(
+                                            memberId = newId,
+                                            docCategory = parsed.docCategory,
+                                            docSubType = parsed.docSubType,
+                                            nameOnDocument = parsed.extractedName,
+                                            documentNumber = parsed.documentNumber,
+                                            issuingAuthority = parsed.issuingAuthority,
+                                            issueDate = parsed.issueDate,
+                                            expiryDate = parsed.expiryDate,
+                                            linkedMobile = parsed.linkedMobile,
+                                            extraAttributesJson = parsed.extraAttributesJson,
+                                            rawExtractedText = parsed.rawText,
+                                            extractionSource = "SPRINT2_PARSER"
+                                        )
+                                    )
+                                    withContext(Dispatchers.Main) {
+                                        banner = "🆕 Created Profile '${res.cleanedDisplayName}' • $msg"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Parse Columns & Route to Database") }
+            }
+            item {
+                Text(banner, color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodyMedium)
+                HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                Text("Profiles (${members.size}) • Documents (${docs.size})", fontWeight = FontWeight.Bold)
+            }
+            items(members) { m ->
+                val mDocs = docs.filter { it.memberId == m.memberId }
+                OutlinedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("👤 ${m.canonicalName} (Phonetic: ${m.phoneticPrimary})", fontWeight = FontWeight.Bold)
+                        mDocs.forEach { d ->
                             Text(
-                                text = "Sprint 2: Fuzzy Name & Document Parser Active",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "Jaro-Winkler • Levenshtein • Initial Expansion • Smart Version Audit",
+                                "📄 ${d.docSubType} (v${d.versionNumber}) | No: ${d.documentNumber} | Auth: ${d.issuingAuthority}",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
                     }
                 }
             }
+        }
+    }
 
-            item {
+    val alert = mismatchState
+    if (alert != null) {
+        val (mismatch, parsed) = alert
+        AlertDialog(
+            onDismissRequest = { mismatchState = null },
+            icon = { Icon(Icons.Default.Warning, null) },
+            title = { Text("Spelling / Initial Mismatch") },
+            text = {
                 Text(
-                    text = "1. Load Simulated OCR / Voice Scan Preset:",
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold
+                    "Scanned: '${mismatch.extractedRawName}'\n" +
+                        "Matches Existing: '${mismatch.candidateMember.canonicalName}'\n" +
+                        "Reason: ${mismatch.matchReason} (${(mismatch.similarityScore * 100).toInt()}%)"
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            rawOcrInput = "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\n" +
-                                "Name : Mohammed Riyaz\nFather's Name : Abdul Karim\n" +
-                                "DOB : 14/05/1992\nPermanent Account Number\nABCDE1234F"
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("1. Exact PAN\n(Mohammed Riyaz)", style = MaterialTheme.typography.labelSmall)
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            rawOcrInput = "STATE BANK OF INDIA\nPASSBOOK\n" +
-                                "Account Holder Name : Mohd Rlyaz\n" +
-                                "A/c No : 30948571234\nIFSC : SBIN0040123\n" +
-                                "Mobile : 9876543210"
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("2. Typo Bank\n(Mohd Rlyaz)", style = MaterialTheme.typography.labelSmall)
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            rawOcrInput = "UNION OF INDIA\nDRIVING LICENCE\n" +
-                                "KA25 20200098765\nName : M. Riyaz\n" +
-                                "Issue Date : 10/01/2020\nValid Till : 09/01/2040"
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("3. Initial DL\n(M. Riyaz)", style = MaterialTheme.typography.labelSmall)
-                    }
-                }
-            }
-
-            item {
-                OutlinedTextField(
-                    value = rawOcrInput,
-                    onValueChange = { rawOcrInput = it },
-                    label = { Text("Simulated OCR / Voice Transcript Input") },
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 5
-                )
-            }
-
-            item {
-                Button(
-                    onClick = {
-                        scope.launch(Dispatchers.IO) {
-                            val parsed = DocumentParserEngine.parseDocumentText(rawOcrInput)
-                            val normalizedTokens = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName)
-                            val aliasHitId = dao.findMemberIdByAlias(normalizedTokens)
-                            val currentMembers = dao.getAllFamilyMembersOnce()
-
-                            val resolution = NameResolutionEngine.resolveIdentity(
-                                extractedRawName = parsed.extractedName,
-                                existingMembers = currentMembers,
-                                aliasMemberIdIfFound = aliasHitId
+            },
+            confirmButton = {
+                Button(onClick = {
+                    mismatchState = null
+                    scope.launch(Dispatchers.IO) {
+                        dao.insertAlias(
+                            MemberAliasEntity(
+                                memberId = mismatch.candidateMember.memberId,
+                                aliasNormalized = mismatch.normalizedAliasToSave
                             )
-
-                            when (resolution) {
-                                is NameResolutionResult.ExactOrAliasMatch -> {
-                                    val (_, auditMsg) = dao.upsertDocumentWithVersionAudit(
-                                        DocumentEntity(
-                                            memberId = resolution.member.memberId,
-                                            docCategory = parsed.docCategory,
-                                            docSubType = parsed.docSubType,
-                                            nameOnDocument = parsed.extractedName,
-                                            documentNumber = parsed.documentNumber,
-                                            issuingAuthority = parsed.issuingAuthority,
-                                            issueDate = parsed.issueDate,
-                                            expiryDate = parsed.expiryDate,
-                                            linkedMobile = parsed.linkedMobile,
-                                            extraAttributesJson = parsed.extraAttributesJson,
-                                            rawExtractedText = parsed.rawText,
-                                            extractionSource = "SPRINT2_PARSER"
-                                        )
-                                    )
-                                    withContext(Dispatchers.Main) {
-                                        statusBanner = "✅ Auto-Routed to '${resolution.member.canonicalName}' " +
-                                            "(${resolution.matchedVia}) • $auditMsg"
-                                    }
-                                }
-
-                                is NameResolutionResult.MinimalMismatchAlert -> {
-                                    withContext(Dispatchers.Main) {
-                                        pendingMismatchAlert = Pair(resolution, parsed)
-                                    }
-                                }
-
-                                is NameResolutionResult.NewMemberDetected -> {
-                                    val newMemberId = dao.insertFamilyMember(
-                                        FamilyMemberEntity(
-                                            canonicalName = resolution.cleanedDisplayName,
-                                            sortedTokens = resolution.sortedTokens,
-                                            phoneticPrimary = resolution.phoneticCode,
-                                            relationshipRole = "Family Member"
-                                        )
-                                    )
-                                    val (_, auditMsg) = dao.upsertDocumentWithVersionAudit(
-                                        DocumentEntity(
-                                            memberId = newMemberId,
-                                            docCategory = parsed.docCategory,
-                                            docSubType = parsed.docSubType,
-                                            nameOnDocument = parsed.extractedName,
-                                            documentNumber = parsed.documentNumber,
-                                            issuingAuthority = parsed.issuingAuthority,
-                                            issueDate = parsed.issueDate,
-                                            expiryDate = parsed.expiryDate,
-                                            linkedMobile = parsed.linkedMobile,
-                                            extraAttributesJson = parsed.extraAttributesJson,
-                                            rawExtractedText = parsed.rawText,
-                                            extractionSource = "SPRINT2_PARSER"
-                                        )
-                                    )
-                                    withContext(Dispatchers.Main) {
-                                        statusBanner = "🆕 Created New Family Member '${resolution.cleanedDisplayName}' • $auditMsg"
-                                    }
-                                }
-                            }
+                        )
+                        val (_, msg) = dao.upsertDocumentWithVersionAudit(
+                            DocumentEntity(
+                                memberId = mismatch.candidateMember.memberId,
+                                docCategory = parsed.docCategory,
+                                docSubType = parsed.docSubType,
+                                nameOnDocument = parsed.extractedName,
+                                documentNumber = parsed.documentNumber,
+                                issuingAuthority = parsed.issuingAuthority,
+                                issueDate = parsed.issueDate,
+                                expiryDate = parsed.expiryDate,
+                                linkedMobile = parsed.linkedMobile,
+                                extraAttributesJson = parsed.extraAttributesJson,
+                                rawExtractedText = parsed.rawText,
+                                extractionSource = "ALIAS_MERGED"
+                            )
+                        )
+                        withContext(Dispatchers.Main) {
+                            banner = "✅ Merged into '${mismatch.candidateMember.canonicalName}' & Alias Saved! ($msg)"
                         }
                     }
+                }) { Text("Move to Existing") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = {
+                    mismatchState = null
+                    scope.launch(Dispatchers.IO) {
+                        val id = dao.insertFamilyMember(
+                            FamilyMemberEntity(
+                                canonicalName = mismatch.extractedRawName,
+                                sortedTokens = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName),
+                                phoneticPrimary = NameResolutionEngine.computePhoneticSignature(parsed.extractedName),
+                                relationshipRole = "Family Member"
+                            )
+                        )
+                        dao.upsertDocumentWithVersionAudit(
+                            DocumentEntity(
+                                memberId = id,
+                                docCategory = parsed.docCategory,
+                                docSubType = parsed.docSubType,
+                                nameOnDocument = parsed.extractedName,
+                                documentNumber = parsed.documentNumber,
+                                issuingAuthority = parsed.issuingAuthority,
+                                issueDate = parsed.issueDate,
+                                expiryDate = parsed.expiryDate,
+                                linkedMobile = parsed.linkedMobile,
+                                extraAttributesJson = parsed.extraAttributesJson,
+                                rawExtractedText = parsed.rawText,
+                                extractionSource = "NEW_PROFILE"
+                            )
+                        )
+                        withContext(Dispatchers.Main) {
+                            banner = "🆕 Created Separate Profile '${mismatch.extractedRawName}'"
+                        }
+                    }
+                }) { Text("Create New") }
+            }
+        )
+    }
+}
