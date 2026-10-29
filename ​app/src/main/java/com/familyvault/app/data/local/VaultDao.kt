@@ -42,18 +42,26 @@ interface VaultDao {
     @RawQuery(observedEntities = [DocumentEntity::class])
     suspend fun executeRawDocumentSearch(query: SupportSQLiteQuery): List<DocumentEntity>
 
-    /**
-     * Sub-2ms Offline FTS5 Trigram Search across all document columns and OCR transcripts.
-     */
     suspend fun searchDocumentsFts5(searchTerm: String): List<DocumentEntity> {
         val sanitized = searchTerm.replace("\"", "\"\"").trim()
         if (sanitized.isEmpty()) return emptyList()
-        val sql = """
-            SELECT d.* FROM documents d
-            INNER JOIN documents_fts fts ON d.doc_id = fts.rowid
-            WHERE documents_fts MATCH '"$sanitized"'
-            ORDER BY d.updated_at DESC
-        """.trimIndent()
-        return executeRawDocumentSearch(SimpleSQLiteQuery(sql))
+        return try {
+            val sql = """
+                SELECT d.* FROM documents d
+                INNER JOIN documents_fts fts ON d.doc_id = fts.rowid
+                WHERE documents_fts MATCH '"$sanitized"'
+                ORDER BY d.updated_at DESC
+            """.trimIndent()
+            executeRawDocumentSearch(SimpleSQLiteQuery(sql))
+        } catch (_: Throwable) {
+            val fallbackSql = """
+                SELECT * FROM documents
+                WHERE raw_extracted_text LIKE '%$sanitized%'
+                   OR document_number LIKE '%$sanitized%'
+                   OR name_on_document LIKE '%$sanitized%'
+                ORDER BY updated_at DESC
+            """.trimIndent()
+            executeRawDocumentSearch(SimpleSQLiteQuery(fallbackSql))
+        }
     }
 }
