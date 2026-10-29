@@ -1,87 +1,92 @@
 package com.familyvault.app.crypto
 
 import android.content.Context
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.util.Base64
-import com.google.crypto.tink.Aead
-import com.google.crypto.tink.KeyTemplates
-import com.google.crypto.tink.RegistryConfiguration
-import com.google.crypto.tink.StreamingAead
-import com.google.crypto.tink.aead.AeadConfig
-import com.google.crypto.tink.integration.android.AndroidKeysetManager
-import com.google.crypto.tink.streamingaead.StreamingAeadConfig
+import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 class VaultCryptoManager(context: Context) {
 
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
 
-    private val masterAead: Aead
-    private val fileStreamingAead: StreamingAead
-
-    init {
-        AeadConfig.register()
-        StreamingAeadConfig.register()
-
-        val handles = try {
-            buildKeysets()
-        } catch (t: Throwable) {
-            resetCorruptedKeystore()
-            buildKeysets()
+    private fun getOrCreateHardwareSecretKey(): SecretKey {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        val existingEntry = keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+        if (existingEntry != null) {
+            return existingEntry.secretKey
         }
-        masterAead = handles.first
-        fileStreamingAead = handles.second
+
+        val keyGenerator = KeyGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_AES,
+            ANDROID_KEYSTORE
+        )
+        val spec = KeyGenParameterSpec.Builder(
+            KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .setRandomizedEncryptionRequired(true)
+            .build()
+
+        keyGenerator.init(spec)
+        return keyGenerator.generateKey()
     }
 
-    private fun buildKeysets(): Pair<Aead, StreamingAead> {
-        val aeadHandle = AndroidKeysetManager.Builder()
-            .withSharedPref(appContext, KEYSET_AEAD_NAME, PREFS_FILE)
-            .withKeyTemplate(KeyTemplates.get("AES256_GCM"))
-            .withMasterKeyUri(MASTER_KEY_URI)
-            .build()
-            .keysetHandle
-        val aead = aeadHandle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
+    private fun encryptWithHardwareKey(plainBytes: ByteArray, associatedData: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateHardwareSecretKey())
+        cipher.updateAAD(associatedData)
+        val iv = cipher.iv
+        val cipherBytes = cipher.doFinal(plainBytes)
 
-        val streamHandle = AndroidKeysetManager.Builder()
-            .withSharedPref(appContext, KEYSET_STREAM_NAME, PREFS_FILE)
-            .withKeyTemplate(KeyTemplates.get("AES256_GCM_HKDF_4KB"))
-            .withMasterKeyUri(MASTER_KEY_URI)
-            .build()
-            .keysetHandle
-        val stream = streamHandle.getPrimitive(RegistryConfiguration.get(), StreamingAead::class.java)
-
-        return Pair(aead, stream)
+        // Format: [1-byte IV length][IV bytes][Ciphertext + 128-bit GCM Auth Tag]
+        val combined = ByteArray(1 + iv.size + cipherBytes.size)
+        combined[0] = iv.size.toByte()
+        System.arraycopy(iv, 0, combined, 1, iv.size)
+        System.arraycopy(cipherBytes, 0, combined, 1 + iv.size, cipherBytes.size)
+        return combined
     }
 
-    private fun resetCorruptedKeystore() {
-        prefs.edit().clear().commit()
-        try {
-            val ks = KeyStore.getInstance("AndroidKeyStore")
-            ks.load(null)
-            ks.deleteEntry("family_vault_hardware_master_key")
-        } catch (_: Throwable) {}
+    private fun decryptWithHardwareKey(combined: ByteArray, associatedData: ByteArray): ByteArray {
+        val ivSize = combined[0].toInt() and 0xFF
+        val iv = combined.copyOfRange(1, 1 + ivSize)
+        val cipherBytes = combined.copyOfRange(1 + ivSize, combined.size)
+
+        val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+        val spec = GCMParameterSpec(GCM_TAG_BITS, iv)
+        cipher.init(Cipher.DECRYPT_MODE, getOrCreateHardwareSecretKey(), spec)
+        cipher.updateAAD(associatedData)
+        return cipher.doFinal(cipherBytes)
     }
 
     fun getOrCreateDatabasePassphrase(): ByteArray {
-        val existingCiphertextB64 = prefs.getString(ENCRYPTED_DB_PASS_KEY, null)
-        if (existingCiphertextB64 != null) {
+        val existingB64 = prefs.getString(ENCRYPTED_DB_PASS_KEY, null)
+        if (existingB64 != null) {
             try {
-                val ciphertext = Base64.decode(existingCiphertextB64, Base64.NO_WRAP)
-                return masterAead.decrypt(ciphertext, DB_AAD)
+                val combined = Base64.decode(existingB64, Base64.NO_WRAP)
+                return decryptWithHardwareKey(combined, DB_AAD)
             } catch (_: Throwable) {
                 prefs.edit().remove(ENCRYPTED_DB_PASS_KEY).commit()
             }
         }
+
         val newPassphrase = ByteArray(32).also { SecureRandom().nextBytes(it) }
-        val ciphertext = masterAead.encrypt(newPassphrase, DB_AAD)
+        val encrypted = encryptWithHardwareKey(newPassphrase, DB_AAD)
         prefs.edit()
-            .putString(ENCRYPTED_DB_PASS_KEY, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+            .putString(ENCRYPTED_DB_PASS_KEY, Base64.encodeToString(encrypted, Base64.NO_WRAP))
             .commit()
         return newPassphrase
     }
@@ -91,31 +96,26 @@ class VaultCryptoManager(context: Context) {
         destinationFile: File,
         associatedData: String
     ): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        FileOutputStream(destinationFile).use { fileOut ->
-            fileStreamingAead.newEncryptingStream(fileOut, associatedData.toByteArray()).use { cipherOut ->
-                val buffer = ByteArray(4096)
-                var read: Int
-                while (inputStream.read(buffer).also { read = it } != -1) {
-                    cipherOut.write(buffer, 0, read)
-                    digest.update(buffer, 0, read)
-                }
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        val rawBytes = inputStream.readBytes()
+        val digest = MessageDigest.getInstance("SHA-256").digest(rawBytes)
+        val encryptedBytes = encryptWithHardwareKey(rawBytes, associatedData.toByteArray())
+        destinationFile.writeBytes(encryptedBytes)
+        return digest.joinToString("") { "%02x".format(it) }
     }
 
     fun openDecryptedStream(encryptedFile: File, associatedData: String): InputStream {
-        val fileIn = FileInputStream(encryptedFile)
-        return fileStreamingAead.newDecryptingStream(fileIn, associatedData.toByteArray())
+        val encryptedBytes = encryptedFile.readBytes()
+        val decryptedBytes = decryptWithHardwareKey(encryptedBytes, associatedData.toByteArray())
+        return ByteArrayInputStream(decryptedBytes)
     }
 
     companion object {
-        private const val PREFS_FILE = "family_vault_keyset_prefs"
-        private const val KEYSET_AEAD_NAME = "master_db_keyset"
-        private const val KEYSET_STREAM_NAME = "file_stream_keyset"
-        private const val ENCRYPTED_DB_PASS_KEY = "wrapped_sqlcipher_pass"
-        private const val MASTER_KEY_URI = "android-keystore://family_vault_hardware_master_key"
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private const val KEY_ALIAS = "family_vault_hw_aes256_v2"
+        private const val AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
+        private const val GCM_TAG_BITS = 128
+        private const val PREFS_FILE = "family_vault_secure_prefs"
+        private const val ENCRYPTED_DB_PASS_KEY = "wrapped_sqlcipher_pass_v2"
         private val DB_AAD = "SQLCipher_FamilyVault_v2".toByteArray()
     }
 }
