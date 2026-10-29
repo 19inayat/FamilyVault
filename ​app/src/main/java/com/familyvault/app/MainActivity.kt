@@ -16,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -26,10 +27,11 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import com.familyvault.app.crypto.VaultCryptoManager
-import com.familyvault.app.data.local.DocumentEntity
-import com.familyvault.app.data.local.FamilyMemberEntity
-import com.familyvault.app.data.local.VaultDatabase
-import com.familyvault.app.data.local.searchDocumentsFts5
+import com.familyvault.app.data.local.*
+import com.familyvault.app.domain.DocumentParserEngine
+import com.familyvault.app.domain.NameResolutionEngine
+import com.familyvault.app.domain.NameResolutionResult
+import com.familyvault.app.domain.ParsedDocumentPayload
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -37,13 +39,12 @@ import kotlinx.coroutines.withContext
 class MainActivity : FragmentActivity() {
 
     private var unlockedDb by mutableStateOf<VaultDatabase?>(null)
-    private var authStatusMessage by mutableStateOf("Vault Locked — Tap Authenticate to Unlock")
+    private var authStatusMessage by mutableStateOf("Vault Locked — Biometric Verification Required")
     private var fatalDiagnosticLog by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Fixed: uses lowercase .simpleName instead of .Name
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             runOnUiThread {
                 fatalDiagnosticLog = "Thread: ${thread.name}\n" +
@@ -73,12 +74,11 @@ class MainActivity : FragmentActivity() {
                         currentDb == null -> {
                             LockedVaultScreen(
                                 statusMessage = authStatusMessage,
-                                onUnlockRequest = { triggerBiometricPromptSafe() },
-                                onDirectPinFallback = { unlockSqlCipherDatabase() }
+                                onUnlockRequest = { triggerBiometricPromptSafe() }
                             )
                         }
                         else -> {
-                            Sprint1VerifiedDashboard(
+                            Sprint2ParserWorkbenchScreen(
                                 db = currentDb,
                                 onLockVault = {
                                     VaultDatabase.lockAndCloseDatabase()
@@ -118,7 +118,7 @@ class MainActivity : FragmentActivity() {
                 }
                 biometricManager.canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS -> {
                     promptBuilder.setAllowedAuthenticators(BIOMETRIC_STRONG)
-                    promptBuilder.setNegativeButtonText("Use Vault Fallback")
+                    promptBuilder.setNegativeButtonText("Cancel")
                 }
                 else -> {
                     unlockSqlCipherDatabase()
@@ -138,7 +138,7 @@ class MainActivity : FragmentActivity() {
 
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                         super.onAuthenticationError(errorCode, errString)
-                        authStatusMessage = "Biometric Status: $errString"
+                        authStatusMessage = "Biometric Locked: $errString"
                     }
 
                     override fun onAuthenticationFailed() {
@@ -149,8 +149,7 @@ class MainActivity : FragmentActivity() {
             )
             biometricPrompt.authenticate(promptBuilder.build())
         } catch (t: Throwable) {
-            authStatusMessage = "Biometric Fallback Activated: ${t.localizedMessage}"
-            unlockSqlCipherDatabase()
+            authStatusMessage = "Biometric Error: ${t.localizedMessage}"
         }
     }
 
@@ -162,6 +161,8 @@ class MainActivity : FragmentActivity() {
                 val crypto = VaultCryptoManager(applicationContext)
                 passphraseBytes = crypto.getOrCreateDatabasePassphrase()
                 val db = VaultDatabase.getUnlockedInstance(applicationContext, passphraseBytes)
+                // Clean up Sprint 1 dummy test profile automatically
+                db.vaultDao().cleanupSprint1TestProfile()
                 withContext(Dispatchers.Main) {
                     unlockedDb = db
                 }
@@ -191,10 +192,7 @@ private fun DiagnosticErrorScreen(log: String, onDismiss: () -> Unit) {
             color = MaterialTheme.colorScheme.error,
             fontWeight = FontWeight.Bold
         )
-        Text(
-            text = log,
-            style = MaterialTheme.typography.bodySmall
-        )
+        Text(text = log, style = MaterialTheme.typography.bodySmall)
         Button(onClick = onDismiss) {
             Text("Return to Lock Screen")
         }
@@ -204,8 +202,7 @@ private fun DiagnosticErrorScreen(log: String, onDismiss: () -> Unit) {
 @Composable
 private fun LockedVaultScreen(
     statusMessage: String,
-    onUnlockRequest: () -> Unit,
-    onDirectPinFallback: () -> Unit
+    onUnlockRequest: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -241,27 +238,38 @@ private fun LockedVaultScreen(
             Spacer(modifier = Modifier.width(8.dp))
             Text("Authenticate with Biometrics")
         }
-        Spacer(modifier = Modifier.height(12.dp))
-        OutlinedButton(onClick = onDirectPinFallback) {
-            Text("Unlock Directly (Hardware Keystore Test)")
-        }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Sprint1VerifiedDashboard(
+private fun Sprint2ParserWorkbenchScreen(
     db: VaultDatabase,
     onLockVault: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
-    val members by db.vaultDao().observeAllFamilyMembers().collectAsState(initial = emptyList())
-    var ftsTestResult by remember { mutableStateOf("Tap 'Run Diagnostic Self-Test' to verify SQLCipher + FTS5.") }
+    val dao = remember { db.vaultDao() }
+    val members by dao.observeAllFamilyMembers().collectAsState(initial = emptyList())
+    val allDocs by dao.observeAllDocuments().collectAsState(initial = emptyList())
+
+    var rawOcrInput by remember {
+        mutableStateOf(
+            "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nFather's Name : Abdul Karim\nDOB : 14/05/1992\nPermanent Account Number\nABCDE1234F"
+        )
+    }
+    var statusBanner by remember {
+        mutableStateOf("Select a preset scan below or edit text, then tap 'Parse & Route to Database'.")
+    }
+
+    // State for Fuzzy Mismatch Alert Dialog
+    var pendingMismatchAlert by remember {
+        mutableStateOf<Pair<NameResolutionResult.MinimalMismatchAlert, ParsedDocumentPayload>?>(null)
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("FamilyVault • Sprint 1 Core") },
+                title = { Text("FamilyVault • Sprint 2 Engine") },
                 actions = {
                     TextButton(onClick = onLockVault) {
                         Text("Lock Vault")
@@ -270,121 +278,174 @@ private fun Sprint1VerifiedDashboard(
             )
         }
     ) { padding ->
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
-                )
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = null,
-                        modifier = Modifier.size(36.dp)
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
                     )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Column {
-                        Text(
-                            text = "SQLCipher 4.6.1 AES-256 Unlocked",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            modifier = Modifier.size(32.dp)
                         )
-                        Text(
-                            text = "Realme Android 13 Verified • Zero Internet • Hardware TEE Keystore",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-            }
-
-            Button(
-                onClick = {
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            val dao = db.vaultDao()
-                            val existing = dao.getAllFamilyMembersOnce()
-                            val memberId = if (existing.isEmpty()) {
-                                dao.insertFamilyMember(
-                                    FamilyMemberEntity(
-                                        canonicalName = "Self Profile (Test)",
-                                        sortedTokens = "PROFILE SELF TEST",
-                                        phoneticPrimary = "SLF",
-                                        relationshipRole = "Self"
-                                    )
-                                )
-                            } else {
-                                existing.first().memberId
-                            }
-
-                            dao.insertDocument(
-                                DocumentEntity(
-                                    memberId = memberId,
-                                    docCategory = "ID_CARD",
-                                    docSubType = "PAN Card",
-                                    nameOnDocument = "Self Profile",
-                                    documentNumber = "ABCDE1234F",
-                                    issuingAuthority = "Income Tax Department",
-                                    rawExtractedText = "INCOME TAX DEPARTMENT GOVT OF INDIA IFSC SBIN0040123",
-                                    extractionSource = "SPRINT1_DIAGNOSTIC"
-                                )
-                            )
-
-                            val startNs = System.nanoTime()
-                            val ftsHits = dao.searchDocumentsFts5("04012")
-                            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0
-
-                            withContext(Dispatchers.Main) {
-                                ftsTestResult = "✅ FTS5 Substring Search ('04012' inside 'SBIN0040123') " +
-                                    "returned ${ftsHits.size} record(s) in ${"%.2f".format(elapsedMs)} ms!"
-                            }
-                        } catch (t: Throwable) {
-                            withContext(Dispatchers.Main) {
-                                ftsTestResult = "❌ Test Error: ${t.localizedMessage}"
-                            }
-                        }
-                    }
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Run Diagnostic Self-Test (Insert & FTS5 Search)")
-            }
-
-            Text(
-                text = ftsTestResult,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.secondary
-            )
-
-            HorizontalDivider()
-
-            Text(
-                text = "Encrypted Family Profiles (${members.size})",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
-
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(members) { member ->
-                    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
-                        Column(modifier = Modifier.padding(12.dp)) {
-                            Text(member.canonicalName, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
                             Text(
-                                "Role: ${member.relationshipRole} • Tokens: ${member.sortedTokens}",
+                                text = "Sprint 2: Fuzzy Name & Document Parser Active",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Jaro-Winkler • Levenshtein • Initial Expansion • Smart Version Audit",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
                     }
                 }
             }
-        }
-    }
-}
+
+            item {
+                Text(
+                    text = "1. Load Simulated OCR / Voice Scan Preset:",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            rawOcrInput = "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\n" +
+                                "Name : Mohammed Riyaz\nFather's Name : Abdul Karim\n" +
+                                "DOB : 14/05/1992\nPermanent Account Number\nABCDE1234F"
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("1. Exact PAN\n(Mohammed Riyaz)", style = MaterialTheme.typography.labelSmall)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            rawOcrInput = "STATE BANK OF INDIA\nPASSBOOK\n" +
+                                "Account Holder Name : Mohd Rlyaz\n" +
+                                "A/c No : 30948571234\nIFSC : SBIN0040123\n" +
+                                "Mobile : 9876543210"
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("2. Typo Bank\n(Mohd Rlyaz)", style = MaterialTheme.typography.labelSmall)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            rawOcrInput = "UNION OF INDIA\nDRIVING LICENCE\n" +
+                                "KA25 20200098765\nName : M. Riyaz\n" +
+                                "Issue Date : 10/01/2020\nValid Till : 09/01/2040"
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("3. Initial DL\n(M. Riyaz)", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            item {
+                OutlinedTextField(
+                    value = rawOcrInput,
+                    onValueChange = { rawOcrInput = it },
+                    label = { Text("Simulated OCR / Voice Transcript Input") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 5
+                )
+            }
+
+            item {
+                Button(
+                    onClick = {
+                        scope.launch(Dispatchers.IO) {
+                            val parsed = DocumentParserEngine.parseDocumentText(rawOcrInput)
+                            val normalizedTokens = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName)
+                            val aliasHitId = dao.findMemberIdByAlias(normalizedTokens)
+                            val currentMembers = dao.getAllFamilyMembersOnce()
+
+                            val resolution = NameResolutionEngine.resolveIdentity(
+                                extractedRawName = parsed.extractedName,
+                                existingMembers = currentMembers,
+                                aliasMemberIdIfFound = aliasHitId
+                            )
+
+                            when (resolution) {
+                                is NameResolutionResult.ExactOrAliasMatch -> {
+                                    val (_, auditMsg) = dao.upsertDocumentWithVersionAudit(
+                                        DocumentEntity(
+                                            memberId = resolution.member.memberId,
+                                            docCategory = parsed.docCategory,
+                                            docSubType = parsed.docSubType,
+                                            nameOnDocument = parsed.extractedName,
+                                            documentNumber = parsed.documentNumber,
+                                            issuingAuthority = parsed.issuingAuthority,
+                                            issueDate = parsed.issueDate,
+                                            expiryDate = parsed.expiryDate,
+                                            linkedMobile = parsed.linkedMobile,
+                                            extraAttributesJson = parsed.extraAttributesJson,
+                                            rawExtractedText = parsed.rawText,
+                                            extractionSource = "SPRINT2_PARSER"
+                                        )
+                                    )
+                                    withContext(Dispatchers.Main) {
+                                        statusBanner = "✅ Auto-Routed to '${resolution.member.canonicalName}' " +
+                                            "(${resolution.matchedVia}) • $auditMsg"
+                                    }
+                                }
+
+                                is NameResolutionResult.MinimalMismatchAlert -> {
+                                    withContext(Dispatchers.Main) {
+                                        pendingMismatchAlert = Pair(resolution, parsed)
+                                    }
+                                }
+
+                                is NameResolutionResult.NewMemberDetected -> {
+                                    val newMemberId = dao.insertFamilyMember(
+                                        FamilyMemberEntity(
+                                            canonicalName = resolution.cleanedDisplayName,
+                                            sortedTokens = resolution.sortedTokens,
+                                            phoneticPrimary = resolution.phoneticCode,
+                                            relationshipRole = "Family Member"
+                                        )
+                                    )
+                                    val (_, auditMsg) = dao.upsertDocumentWithVersionAudit(
+                                        DocumentEntity(
+                                            memberId = newMemberId,
+                                            docCategory = parsed.docCategory,
+                                            docSubType = parsed.docSubType,
+                                            nameOnDocument = parsed.extractedName,
+                                            documentNumber = parsed.documentNumber,
+                                            issuingAuthority = parsed.issuingAuthority,
+                                            issueDate = parsed.issueDate,
+                                            expiryDate = parsed.expiryDate,
+                                            linkedMobile = parsed.linkedMobile,
+                                            extraAttributesJson = parsed.extraAttributesJson,
+                                            rawExtractedText = parsed.rawText,
+                                            extractionSource = "SPRINT2_PARSER"
+                                        )
+                                    )
+                                    withContext(Dispatchers.Main) {
+                                        statusBanner = "🆕 Created New Family Member '${resolution.cleanedDisplayName}' • $auditMsg"
+                                    }
+                                }
+                            }
+                        }
+                    }
