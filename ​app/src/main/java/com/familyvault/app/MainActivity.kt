@@ -1,13 +1,21 @@
 package com.familyvault.app
 
+import android.app.Activity
+import android.content.Intent
+import android.graphics.BitmapFactory
 import android.os.Bundle
+import android.speech.RecognizerIntent
 import android.view.WindowManager
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -19,6 +27,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -27,9 +36,15 @@ import androidx.lifecycle.lifecycleScope
 import com.familyvault.app.crypto.VaultCryptoManager
 import com.familyvault.app.data.local.*
 import com.familyvault.app.domain.*
+import com.familyvault.app.scanner.ScanAndVoiceProcessor
+import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.Locale
 
 class MainActivity : FragmentActivity() {
 
@@ -50,11 +65,15 @@ class MainActivity : FragmentActivity() {
                     if (db == null) {
                         LockedScreen(authStatus) { triggerBiometricPromptSafe() }
                     } else {
-                        Sprint2Workbench(db) {
-                            VaultDatabase.lockAndCloseDatabase()
-                            unlockedDb = null
-                            authStatus = "Vault Locked & RAM Keys Scrubbed"
-                        }
+                        Sprint3ScannerWorkbench(
+                            activity = this@MainActivity,
+                            db = db,
+                            onLock = {
+                                VaultDatabase.lockAndCloseDatabase()
+                                unlockedDb = null
+                                authStatus = "Vault Locked & RAM Keys Scrubbed"
+                            }
+                        )
                     }
                 }
             }
@@ -148,24 +167,73 @@ private fun LockedScreen(status: String, onUnlock: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Sprint2Workbench(db: VaultDatabase, onLock: () -> Unit) {
+private fun Sprint3ScannerWorkbench(
+    activity: Activity,
+    db: VaultDatabase,
+    onLock: () -> Unit
+) {
     val scope = rememberCoroutineScope()
     val dao = remember { db.vaultDao() }
+    val cryptoManager = remember { VaultCryptoManager(activity.applicationContext) }
     val members by dao.observeAllFamilyMembers().collectAsState(initial = emptyList())
     val docs by dao.observeAllDocuments().collectAsState(initial = emptyList())
 
     var ocrInput by remember {
-        mutableStateOf("INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nFather's Name : Abdul Karim\nDOB : 14/05/1992\nPermanent Account Number\nABCDE1234F")
+        mutableStateOf("INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nPermanent Account Number\nABCDE1234F")
     }
-    var banner by remember { mutableStateOf("Select a preset below and tap 'Parse & Route to Database'.") }
+    var banner by remember { mutableStateOf("Tap 'Scan Document' or 'Voice Input' to capture real data.") }
+    var pendingEncryptedScanPath by remember { mutableStateOf<Pair<String, String>?>(null) }
     var mismatchState by remember {
         mutableStateOf<Pair<NameResolutionResult.MinimalMismatchAlert, ParsedDocumentPayload>?>(null)
+    }
+
+    // 1. ML Kit Document Scanner Launcher
+    val scannerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(result.data)
+            val firstPageUri = scanResult?.pages?.firstOrNull()?.imageUri
+            if (firstPageUri != null) {
+                banner = "⏳ Running Blur/Glare Check + Parallel OCR & QR Decoder..."
+                scope.launch {
+                    try {
+                        val processed = ScanAndVoiceProcessor.processScannedDocumentUri(
+                            context = activity,
+                            imageUri = firstPageUri,
+                            cryptoManager = cryptoManager
+                        )
+                        ocrInput = processed.parsedPayload.rawText
+                        pendingEncryptedScanPath = Pair(processed.encryptedFilePath, processed.sha256Hash)
+                        banner = "✅ Scan Encrypted! [${processed.qualityReport}] " +
+                            (if (processed.qrVerified) "• QR Verified!" else "• OCR Extracted") +
+                            " — Tap 'Parse & Route to Database' below."
+                    } catch (t: Throwable) {
+                        banner = "❌ Scan Processing Error: ${t.localizedMessage}"
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. High-Precision Voice Dictation Launcher
+    val voiceLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val spokenList = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            val bestTranscript = spokenList?.firstOrNull()
+            if (!bestTranscript.isNullOrBlank()) {
+                ocrInput = ScanAndVoiceProcessor.formatVoiceTranscriptForParser(bestTranscript)
+                banner = "🎙️ Voice Captured & Formatted! Review below and tap 'Parse & Route'."
+            }
+        }
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("FamilyVault • Sprint 2 Engine") },
+                title = { Text("FamilyVault • Sprint 3 Scanner") },
                 actions = { TextButton(onClick = onLock) { Text("Lock Vault") } }
             )
         }
@@ -179,43 +247,74 @@ private fun Sprint2Workbench(db: VaultDatabase, onLock: () -> Unit) {
                     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.CheckCircle, null, Modifier.size(28.dp))
                         Spacer(Modifier.width(10.dp))
-                        Text("Sprint 2 Active: OCR Column Segregation & Fuzzy Name Matcher", fontWeight = FontWeight.Bold)
+                        Text(
+                            "Sprint 3 Active: ML Kit Camera Scanner + QR + Voice Slot-Filler",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
                     }
                 }
             }
+
+            // Camera Scanner & Voice Dictation Action Bar
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
                         onClick = {
-                            ocrInput = "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\nName : Mohammed Riyaz\nFather's Name : Abdul Karim\nDOB : 14/05/1992\nPermanent Account Number\nABCDE1234F"
+                            try {
+                                val options = GmsDocumentScannerOptions.Builder()
+                                    .setGalleryImportAllowed(true)
+                                    .setPageLimit(2)
+                                    .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
+                                    .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                                    .build()
+                                GmsDocumentScanning.getClient(options)
+                                    .getStartScanIntent(activity)
+                                    .addOnSuccessListener { intentSender ->
+                                        scannerLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+                                    }
+                                    .addOnFailureListener { e ->
+                                        banner = "Scanner Init Error: ${e.localizedMessage}"
+                                    }
+                            } catch (t: Throwable) {
+                                banner = "Scanner Error: ${t.localizedMessage}"
+                            }
                         },
                         modifier = Modifier.weight(1f)
-                    ) { Text("1. PAN\n(Exact)", style = MaterialTheme.typography.labelSmall) }
+                    ) {
+                        Text("📷 Scan Document")
+                    }
 
-                    OutlinedButton(
+                    ElevatedButton(
                         onClick = {
-                            ocrInput = "STATE BANK OF INDIA\nPASSBOOK\nAccount Holder Name : Mohd Rlyaz\nA/c No : 30948571234\nIFSC : SBIN0040123\nMobile : 9876543210"
+                            try {
+                                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                                    putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak: 'Name [Name] Document [Type] Number [No] Authority [Name]'")
+                                }
+                                voiceLauncher.launch(intent)
+                            } catch (t: Throwable) {
+                                banner = "Voice Input unavailable: ${t.localizedMessage}"
+                            }
                         },
                         modifier = Modifier.weight(1f)
-                    ) { Text("2. Bank\n(Typo)", style = MaterialTheme.typography.labelSmall) }
-
-                    OutlinedButton(
-                        onClick = {
-                            ocrInput = "UNION OF INDIA\nDRIVING LICENCE\nKA25 20200098765\nName : M. Riyaz\nIssue Date : 10/01/2020\nValid Till : 09/01/2040"
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("3. DL\n(Initial)", style = MaterialTheme.typography.labelSmall) }
+                    ) {
+                        Text("🎙️ Voice Input")
+                    }
                 }
             }
+
             item {
                 OutlinedTextField(
                     value = ocrInput,
                     onValueChange = { ocrInput = it },
-                    label = { Text("Simulated OCR / Voice Input") },
+                    label = { Text("Extracted OCR / QR / Voice Text (Editable)") },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 4
                 )
             }
+
             item {
                 Button(
                     onClick = {
@@ -224,9 +323,11 @@ private fun Sprint2Workbench(db: VaultDatabase, onLock: () -> Unit) {
                             val norm = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName)
                             val aliasId = dao.findMemberIdByAlias(norm)
                             val existing = dao.getAllFamilyMembersOnce()
+                            val scanAttachment = pendingEncryptedScanPath
+
                             when (val res = NameResolutionEngine.resolveIdentity(parsed.extractedName, existing, aliasId)) {
                                 is NameResolutionResult.ExactOrAliasMatch -> {
-                                    val (_, msg) = dao.upsertDocumentWithVersionAudit(
+                                    val (docId, msg) = dao.upsertDocumentWithVersionAudit(
                                         DocumentEntity(
                                             memberId = res.member.memberId,
                                             docCategory = parsed.docCategory,
@@ -239,11 +340,23 @@ private fun Sprint2Workbench(db: VaultDatabase, onLock: () -> Unit) {
                                             linkedMobile = parsed.linkedMobile,
                                             extraAttributesJson = parsed.extraAttributesJson,
                                             rawExtractedText = parsed.rawText,
-                                            extractionSource = "SPRINT2_PARSER"
+                                            extractionSource = if (scanAttachment != null) "CAMERA_SCAN" else "TEXT_OR_VOICE"
                                         )
                                     )
+                                    if (scanAttachment != null) {
+                                        dao.insertAttachment(
+                                            DocumentAttachmentEntity(
+                                                docId = docId,
+                                                pageOrder = 1,
+                                                fileRole = "SCAN_WEBP",
+                                                tinkEncryptedPath = scanAttachment.first,
+                                                sha256Hash = scanAttachment.second
+                                            )
+                                        )
+                                        pendingEncryptedScanPath = null
+                                    }
                                     withContext(Dispatchers.Main) {
-                                        banner = "✅ Routed to '${res.member.canonicalName}' (${res.matchedVia}) • $msg"
+                                        banner = "✅ Routed to '${res.member.canonicalName}' • $msg"
                                     }
                                 }
                                 is NameResolutionResult.MinimalMismatchAlert -> {
@@ -258,7 +371,7 @@ private fun Sprint2Workbench(db: VaultDatabase, onLock: () -> Unit) {
                                             relationshipRole = "Family Member"
                                         )
                                     )
-                                    val (_, msg) = dao.upsertDocumentWithVersionAudit(
+                                    val (docId, msg) = dao.upsertDocumentWithVersionAudit(
                                         DocumentEntity(
                                             memberId = newId,
                                             docCategory = parsed.docCategory,
@@ -271,121 +384,17 @@ private fun Sprint2Workbench(db: VaultDatabase, onLock: () -> Unit) {
                                             linkedMobile = parsed.linkedMobile,
                                             extraAttributesJson = parsed.extraAttributesJson,
                                             rawExtractedText = parsed.rawText,
-                                            extractionSource = "SPRINT2_PARSER"
+                                            extractionSource = if (scanAttachment != null) "CAMERA_SCAN" else "TEXT_OR_VOICE"
                                         )
                                     )
-                                    withContext(Dispatchers.Main) {
-                                        banner = "🆕 Created Profile '${res.cleanedDisplayName}' • $msg"
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("Parse Columns & Route to Database") }
-            }
-            item {
-                Text(banner, color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodyMedium)
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                Text("Profiles (${members.size}) • Documents (${docs.size})", fontWeight = FontWeight.Bold)
-            }
-            items(members) { m ->
-                val mDocs = docs.filter { it.memberId == m.memberId }
-                OutlinedCard(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("👤 ${m.canonicalName} (Phonetic: ${m.phoneticPrimary})", fontWeight = FontWeight.Bold)
-                        mDocs.forEach { d ->
-                            Text(
-                                "📄 ${d.docSubType} (v${d.versionNumber}) | No: ${d.documentNumber} | Auth: ${d.issuingAuthority}",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    val alert = mismatchState
-    if (alert != null) {
-        val (mismatch, parsed) = alert
-        AlertDialog(
-            onDismissRequest = { mismatchState = null },
-            icon = { Icon(Icons.Default.Warning, null) },
-            title = { Text("Spelling / Initial Mismatch") },
-            text = {
-                Text(
-                    "Scanned: '${mismatch.extractedRawName}'\n" +
-                        "Matches Existing: '${mismatch.candidateMember.canonicalName}'\n" +
-                        "Reason: ${mismatch.matchReason} (${(mismatch.similarityScore * 100).toInt()}%)"
-                )
-            },
-            confirmButton = {
-                Button(onClick = {
-                    mismatchState = null
-                    scope.launch(Dispatchers.IO) {
-                        dao.insertAlias(
-                            MemberAliasEntity(
-                                memberId = mismatch.candidateMember.memberId,
-                                aliasNormalized = mismatch.normalizedAliasToSave
-                            )
-                        )
-                        val (_, msg) = dao.upsertDocumentWithVersionAudit(
-                            DocumentEntity(
-                                memberId = mismatch.candidateMember.memberId,
-                                docCategory = parsed.docCategory,
-                                docSubType = parsed.docSubType,
-                                nameOnDocument = parsed.extractedName,
-                                documentNumber = parsed.documentNumber,
-                                issuingAuthority = parsed.issuingAuthority,
-                                issueDate = parsed.issueDate,
-                                expiryDate = parsed.expiryDate,
-                                linkedMobile = parsed.linkedMobile,
-                                extraAttributesJson = parsed.extraAttributesJson,
-                                rawExtractedText = parsed.rawText,
-                                extractionSource = "ALIAS_MERGED"
-                            )
-                        )
-                        withContext(Dispatchers.Main) {
-                            banner = "✅ Merged into '${mismatch.candidateMember.canonicalName}' & Alias Saved! ($msg)"
-                        }
-                    }
-                }) { Text("Move to Existing") }
-            },
-            dismissButton = {
-                OutlinedButton(onClick = {
-                    mismatchState = null
-                    scope.launch(Dispatchers.IO) {
-                        val id = dao.insertFamilyMember(
-                            FamilyMemberEntity(
-                                canonicalName = mismatch.extractedRawName,
-                                sortedTokens = NameResolutionEngine.normalizeToSortedTokens(parsed.extractedName),
-                                phoneticPrimary = NameResolutionEngine.computePhoneticSignature(parsed.extractedName),
-                                relationshipRole = "Family Member"
-                            )
-                        )
-                        dao.upsertDocumentWithVersionAudit(
-                            DocumentEntity(
-                                memberId = id,
-                                docCategory = parsed.docCategory,
-                                docSubType = parsed.docSubType,
-                                nameOnDocument = parsed.extractedName,
-                                documentNumber = parsed.documentNumber,
-                                issuingAuthority = parsed.issuingAuthority,
-                                issueDate = parsed.issueDate,
-                                expiryDate = parsed.expiryDate,
-                                linkedMobile = parsed.linkedMobile,
-                                extraAttributesJson = parsed.extraAttributesJson,
-                                rawExtractedText = parsed.rawText,
-                                extractionSource = "NEW_PROFILE"
-                            )
-                        )
-                        withContext(Dispatchers.Main) {
-                            banner = "🆕 Created Separate Profile '${mismatch.extractedRawName}'"
-                        }
-                    }
-                }) { Text("Create New") }
-            }
-        )
-    }
-}
+                                    if (scanAttachment != null) {
+                                        dao.insertAttachment(
+                                            DocumentAttachmentEntity(
+                                                docId = docId,
+                                                pageOrder = 1,
+                                                fileRole = "SCAN_WEBP",
+                                                tinkEncryptedPath = scanAttachment.first,
+                                                sha256Hash = scanAttachment.second
+                                            )
+                                        )
+                                        pendingEncryptedScanPath = null
