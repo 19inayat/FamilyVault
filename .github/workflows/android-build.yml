@@ -24,111 +24,1929 @@ jobs:
           path: ~/.android/debug.keystore
           key: familyvault-persistent-debug-keystore-v1
 
-      - name: 3. Verify Source Tree & Enforce Build Configuration
+      - name: 3. Generate Complete Sprint 3.2 Source Tree (All 8 Kotlin Files)
         run: |
+          rm -rf app
           mkdir -p app/src/main/java/com/familyvault/app/crypto
           mkdir -p app/src/main/java/com/familyvault/app/data/local
           mkdir -p app/src/main/java/com/familyvault/app/domain
           mkdir -p app/src/main/java/com/familyvault/app/scanner
 
-          sed 's/^          //' << 'EOF' > app/build.gradle.kts
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-              id("org.jetbrains.kotlin.plugin.compose")
-              id("com.google.devtools.ksp")
-          }
-          android {
-              namespace = "com.familyvault.app"
-              compileSdk = 34
-              defaultConfig {
-                  applicationId = "com.familyvault.app"
-                  minSdk = 26
-                  targetSdk = 34
-                  versionCode = 9
-                  versionName = "0.3.2-tagless-ocr"
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_lock_lock"
+                  android:label="FamilyVault"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/crypto/VaultCryptoManager.kt
+          package com.familyvault.app.crypto
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import java.io.ByteArrayInputStream
+          import java.io.File
+          import java.io.InputStream
+          import java.security.KeyStore
+          import java.security.MessageDigest
+          import java.security.SecureRandom
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+
+          class VaultCryptoManager(context: Context) {
+
+              private val appContext = context.applicationContext
+              private val prefs = appContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+
+              private fun getOrCreateHardwareSecretKey(): SecretKey {
+                  val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                  val existingEntry = keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+                  if (existingEntry != null) return existingEntry.secretKey
+
+                  val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+                  val spec = KeyGenParameterSpec.Builder(
+                      KEY_ALIAS,
+                      KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                  )
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                      .setKeySize(256)
+                      .setRandomizedEncryptionRequired(true)
+                      .build()
+
+                  keyGenerator.init(spec)
+                  return keyGenerator.generateKey()
               }
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
+
+              private fun encryptWithHardwareKey(plainBytes: ByteArray, associatedData: ByteArray): ByteArray {
+                  val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+                  cipher.init(Cipher.ENCRYPT_MODE, getOrCreateHardwareSecretKey())
+                  cipher.updateAAD(associatedData)
+                  val iv = cipher.iv
+                  val cipherBytes = cipher.doFinal(plainBytes)
+
+                  val combined = ByteArray(1 + iv.size + cipherBytes.size)
+                  combined[0] = iv.size.toByte()
+                  System.arraycopy(iv, 0, combined, 1, iv.size)
+                  System.arraycopy(cipherBytes, 0, combined, 1 + iv.size, cipherBytes.size)
+                  return combined
               }
-              kotlinOptions { jvmTarget = "17" }
-              buildFeatures { compose = true }
-              packaging {
-                  resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
-                  jniLibs { useLegacyPackaging = true }
+
+              private fun decryptWithHardwareKey(combined: ByteArray, associatedData: ByteArray): ByteArray {
+                  val ivSize = combined[0].toInt() and 0xFF
+                  val iv = combined.copyOfRange(1, 1 + ivSize)
+                  val cipherBytes = combined.copyOfRange(1 + ivSize, combined.size)
+
+                  val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+                  val spec = GCMParameterSpec(GCM_TAG_BITS, iv)
+                  cipher.init(Cipher.DECRYPT_MODE, getOrCreateHardwareSecretKey(), spec)
+                  cipher.updateAAD(associatedData)
+                  return cipher.doFinal(cipherBytes)
               }
-          }
-          dependencies {
-              implementation("androidx.core:core-ktx:1.13.1")
-              implementation("androidx.appcompat:appcompat:1.7.0")
-              implementation("androidx.fragment:fragment-ktx:1.8.2")
-              implementation("androidx.activity:activity-compose:1.9.1")
-              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
-              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
-              implementation("androidx.biometric:biometric:1.1.0")
 
-              val roomVersion = "2.6.1"
-              implementation("androidx.room:room-runtime:$roomVersion")
-              implementation("androidx.room:room-ktx:$roomVersion")
-              ksp("androidx.room:room-compiler:$roomVersion")
-              implementation("net.zetetic:sqlcipher-android:4.6.1@aar")
-              implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+              fun getOrCreateDatabasePassphrase(): ByteArray {
+                  val existingB64 = prefs.getString(ENCRYPTED_DB_PASS_KEY, null)
+                  if (existingB64 != null) {
+                      try {
+                          val combined = Base64.decode(existingB64, Base64.NO_WRAP)
+                          return decryptWithHardwareKey(combined, DB_AAD)
+                      } catch (_: Throwable) {
+                          prefs.edit().remove(ENCRYPTED_DB_PASS_KEY).commit()
+                      }
+                  }
 
-              implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
-              implementation("com.google.mlkit:text-recognition:16.0.1")
-              implementation("com.google.mlkit:barcode-scanning:17.3.0")
+                  val newPassphrase = ByteArray(32).also { SecureRandom().nextBytes(it) }
+                  val encrypted = encryptWithHardwareKey(newPassphrase, DB_AAD)
+                  prefs.edit()
+                      .putString(ENCRYPTED_DB_PASS_KEY, Base64.encodeToString(encrypted, Base64.NO_WRAP))
+                      .commit()
+                  return newPassphrase
+              }
 
-              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              fun encryptStreamToVaultFile(
+                  inputStream: InputStream,
+                  destinationFile: File,
+                  associatedData: String
+              ): String {
+                  val rawBytes = inputStream.readBytes()
+                  val digest = MessageDigest.getInstance("SHA-256").digest(rawBytes)
+                  val encryptedBytes = encryptWithHardwareKey(rawBytes, associatedData.toByteArray())
+                  destinationFile.writeBytes(encryptedBytes)
+                  return digest.joinToString("") { "%02x".format(it) }
+              }
 
-              val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
-              implementation(composeBom)
-              implementation("androidx.compose.ui:ui")
-              implementation("androidx.compose.ui:ui-graphics")
-              implementation("androidx.compose.ui:ui-tooling-preview")
-              implementation("androidx.compose.material3:material3")
+              fun openDecryptedStream(encryptedFile: File, associatedData: String): InputStream {
+                  val encryptedBytes = encryptedFile.readBytes()
+                  val decryptedBytes = decryptWithHardwareKey(encryptedBytes, associatedData.toByteArray())
+                  return ByteArrayInputStream(decryptedBytes)
+              }
+
+              companion object {
+                  private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+                  private const val KEY_ALIAS = "family_vault_hw_aes256_v2"
+                  private const val AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
+                  private const val GCM_TAG_BITS = 128
+                  private const val PREFS_FILE = "family_vault_secure_prefs"
+                  private const val ENCRYPTED_DB_PASS_KEY = "wrapped_sqlcipher_pass_v2"
+                  private val DB_AAD = "SQLCipher_FamilyVault_v2".toByteArray()
+              }
           }
           EOF
 
-      - name: 4. Security Gate - Verify Zero Internet Permission
-        run: |
-          if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
-            echo "❌ SECURITY VIOLATION: INTERNET permission found!"
-            exit 1
-          fi
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/data/local/Entities.kt
+          package com.familyvault.app.data.local
 
-      - name: 5. Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
+          import androidx.room.ColumnInfo
+          import androidx.room.Entity
+          import androidx.room.ForeignKey
+          import androidx.room.Index
+          import androidx.room.PrimaryKey
 
-      - name: 6. Ensure Persistent Debug Keystore Exists
-        run: |
-          mkdir -p ~/.android
-          if [ ! -f ~/.android/debug.keystore ]; then
-            keytool -genkeypair -v \
-              -keystore ~/.android/debug.keystore \
-              -storepass android -alias androiddebugkey -keypass android \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+          @Entity(
+              tableName = "family_members",
+              indices = [
+                  Index(value = ["canonical_name"], unique = true),
+                  Index(value = ["sorted_tokens"])
+              ]
+          )
+          data class FamilyMemberEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "member_id") val memberId: Long = 0,
+              @ColumnInfo(name = "canonical_name") val canonicalName: String,
+              @ColumnInfo(name = "sorted_tokens") val sortedTokens: String,
+              @ColumnInfo(name = "phonetic_primary") val phoneticPrimary: String,
+              @ColumnInfo(name = "phonetic_secondary") val phoneticSecondary: String? = null,
+              @ColumnInfo(name = "relationship_role") val relationshipRole: String,
+              @ColumnInfo(name = "blood_group") val bloodGroup: String? = null,
+              @ColumnInfo(name = "legacy_folder_uri") val legacyFolderUri: String? = null,
+              @ColumnInfo(name = "created_at") val createdAt: Long = System.currentTimeMillis()
+          )
 
-      - name: 7. Accept Pre-Installed Android SDK Licenses
-        run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          @Entity(
+              tableName = "member_aliases",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = FamilyMemberEntity::class,
+                      parentColumns = ["member_id"],
+                      childColumns = ["member_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [
+                  Index(value = ["member_id"]),
+                  Index(value = ["alias_normalized"], unique = true)
+              ]
+          )
+          data class MemberAliasEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "alias_id") val aliasId: Long = 0,
+              @ColumnInfo(name = "member_id") val memberId: Long,
+              @ColumnInfo(name = "alias_normalized") val aliasNormalized: String
+          )
 
-      - name: 8. Install Gradle 8.10.2
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.10.2'
+          @Entity(
+              tableName = "documents",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = FamilyMemberEntity::class,
+                      parentColumns = ["member_id"],
+                      childColumns = ["member_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [
+                  Index(value = ["member_id"]),
+                  Index(value = ["doc_category", "doc_sub_type"]),
+                  Index(value = ["expiry_date"])
+              ]
+          )
+          data class DocumentEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "doc_id") val docId: Long = 0,
+              @ColumnInfo(name = "member_id") val memberId: Long,
+              @ColumnInfo(name = "doc_category") val docCategory: String,
+              @ColumnInfo(name = "doc_sub_type") val docSubType: String,
+              @ColumnInfo(name = "name_on_document") val nameOnDocument: String,
+              @ColumnInfo(name = "document_number") val documentNumber: String,
+              @ColumnInfo(name = "issuing_authority") val issuingAuthority: String,
+              @ColumnInfo(name = "issue_date") val issueDate: String? = null,
+              @ColumnInfo(name = "expiry_date") val expiryDate: String? = null,
+              @ColumnInfo(name = "linked_mobile") val linkedMobile: String? = null,
+              @ColumnInfo(name = "extra_attributes_json") val extraAttributesJson: String = "{}",
+              @ColumnInfo(name = "raw_extracted_text") val rawExtractedText: String,
+              @ColumnInfo(name = "extraction_source") val extractionSource: String,
+              @ColumnInfo(name = "version_number") val versionNumber: Int = 1,
+              @ColumnInfo(name = "updated_at") val updatedAt: Long = System.currentTimeMillis()
+          )
 
-      - name: 9. Compile Debug APK
-        run: gradle assembleDebug --no-daemon --console=plain
+          @Entity(
+              tableName = "document_attachments",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = DocumentEntity::class,
+                      parentColumns = ["doc_id"],
+                      childColumns = ["doc_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [
+                  Index(value = ["doc_id"]),
+                  Index(value = ["sha256_hash"], unique = true)
+              ]
+          )
+          data class DocumentAttachmentEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "attachment_id") val attachmentId: Long = 0,
+              @ColumnInfo(name = "doc_id") val docId: Long,
+              @ColumnInfo(name = "page_order") val pageOrder: Int,
+              @ColumnInfo(name = "file_role") val fileRole: String,
+              @ColumnInfo(name = "tink_encrypted_path") val tinkEncryptedPath: String,
+              @ColumnInfo(name = "sha256_hash") val sha256Hash: String
+          )
 
-      - name: 10. Upload Compiled APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: FamilyVault-Sprint3.2-TaglessOCR
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          @Entity(
+              tableName = "document_history",
+              foreignKeys = [
+                  ForeignKey(
+                      entity = DocumentEntity::class,
+                      parentColumns = ["doc_id"],
+                      childColumns = ["doc_id"],
+                      onDelete = ForeignKey.CASCADE
+                  )
+              ],
+              indices = [Index(value = ["doc_id"])]
+          )
+          data class DocumentHistoryEntity(
+              @PrimaryKey(autoGenerate = true)
+              @ColumnInfo(name = "history_id") val historyId: Long = 0,
+              @ColumnInfo(name = "doc_id") val docId: Long,
+              @ColumnInfo(name = "version_number") val versionNumber: Int,
+              @ColumnInfo(name = "old_document_number") val oldDocumentNumber: String,
+              @ColumnInfo(name = "old_issue_date") val oldIssueDate: String? = null,
+              @ColumnInfo(name = "old_expiry_date") val oldExpiryDate: String? = null,
+              @ColumnInfo(name = "old_encrypted_path") val oldEncryptedPath: String,
+              @ColumnInfo(name = "archived_at") val archivedAt: Long = System.currentTimeMillis()
+          )
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/data/local/VaultDao.kt
+          package com.familyvault.app.data.local
+
+          import androidx.room.Dao
+          import androidx.room.Insert
+          import androidx.room.OnConflictStrategy
+          import androidx.room.Query
+          import androidx.room.RawQuery
+          import androidx.room.Update
+          import androidx.sqlite.db.SimpleSQLiteQuery
+          import androidx.sqlite.db.SupportSQLiteQuery
+          import kotlinx.coroutines.flow.Flow
+
+          @Dao
+          interface VaultDao {
+              @Insert(onConflict = OnConflictStrategy.ABORT)
+              suspend fun insertFamilyMember(member: FamilyMemberEntity): Long
+
+              @Insert(onConflict = OnConflictStrategy.IGNORE)
+              suspend fun insertAlias(alias: MemberAliasEntity): Long
+
+              @Query("SELECT * FROM family_members ORDER BY canonical_name ASC")
+              fun observeAllFamilyMembers(): Flow<List<FamilyMemberEntity>>
+
+              @Query("SELECT * FROM family_members")
+              suspend fun getAllFamilyMembersOnce(): List<FamilyMemberEntity>
+
+              @Query("SELECT member_id FROM member_aliases WHERE alias_normalized = :normalizedAlias LIMIT 1")
+              suspend fun findMemberIdByAlias(normalizedAlias: String): Long?
+
+              @Query("SELECT * FROM documents ORDER BY updated_at DESC")
+              fun observeAllDocuments(): Flow<List<DocumentEntity>>
+
+              @Query("SELECT * FROM documents WHERE member_id = :memberId AND doc_sub_type = :subType LIMIT 1")
+              suspend fun findExistingDocumentBySubType(memberId: Long, subType: String): DocumentEntity?
+
+              @Insert(onConflict = OnConflictStrategy.REPLACE)
+              suspend fun insertDocument(document: DocumentEntity): Long
+
+              @Update
+              suspend fun updateDocument(document: DocumentEntity)
+
+              @Insert(onConflict = OnConflictStrategy.IGNORE)
+              suspend fun insertAttachment(attachment: DocumentAttachmentEntity): Long
+
+              @Insert(onConflict = OnConflictStrategy.REPLACE)
+              suspend fun insertDocumentHistory(history: DocumentHistoryEntity): Long
+
+              @Query("SELECT * FROM documents WHERE member_id = :memberId ORDER BY doc_category, doc_sub_type")
+              fun observeDocumentsForMember(memberId: Long): Flow<List<DocumentEntity>>
+
+              @Query("DELETE FROM family_members WHERE canonical_name IN ('Self Profile (Test)', 'Unknown Member')")
+              suspend fun cleanupSprint1TestProfile()
+
+              @RawQuery(observedEntities = [DocumentEntity::class])
+              suspend fun executeRawDocumentSearch(query: SupportSQLiteQuery): List<DocumentEntity>
+          }
+
+          suspend fun VaultDao.upsertDocumentWithVersionAudit(incoming: DocumentEntity): Pair<Long, String> {
+              val existing = findExistingDocumentBySubType(incoming.memberId, incoming.docSubType)
+              if (existing == null) {
+                  val id = insertDocument(incoming)
+                  return Pair(id, "Inserted v1 (${incoming.docSubType})")
+              }
+              return if (existing.documentNumber.equals(incoming.documentNumber, ignoreCase = true)) {
+                  val updated = incoming.copy(
+                      docId = existing.docId,
+                      versionNumber = existing.versionNumber,
+                      updatedAt = System.currentTimeMillis()
+                  )
+                  updateDocument(updated)
+                  Pair(existing.docId, "Updated existing ${incoming.docSubType}")
+              } else {
+                  insertDocumentHistory(
+                      DocumentHistoryEntity(
+                          docId = existing.docId,
+                          versionNumber = existing.versionNumber,
+                          oldDocumentNumber = existing.documentNumber,
+                          oldIssueDate = existing.issueDate,
+                          oldExpiryDate = existing.expiryDate,
+                          oldEncryptedPath = "vault_archive_v${existing.versionNumber}"
+                      )
+                  )
+                  val newVersion = existing.versionNumber + 1
+                  updateDocument(incoming.copy(docId = existing.docId, versionNumber = newVersion, updatedAt = System.currentTimeMillis()))
+                  Pair(existing.docId, "Archived v${existing.versionNumber} & Upgraded to v$newVersion")
+              }
+          }
+
+          suspend fun VaultDao.searchDocumentsFts5(searchTerm: String): List<DocumentEntity> {
+              val sanitized = searchTerm.replace("\"", "\"\"").trim()
+              if (sanitized.isEmpty()) return emptyList()
+              return try {
+                  val sql = "SELECT d.* FROM documents d INNER JOIN documents_fts fts ON d.doc_id = fts.rowid WHERE documents_fts MATCH '\"$sanitized\"' ORDER BY d.updated_at DESC"
+                  executeRawDocumentSearch(SimpleSQLiteQuery(sql))
+              } catch (_: Throwable) {
+                  val fallbackSql = "SELECT * FROM documents WHERE raw_extracted_text LIKE '%$sanitized%' OR document_number LIKE '%$sanitized%' ORDER BY updated_at DESC"
+                  executeRawDocumentSearch(SimpleSQLiteQuery(fallbackSql))
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/data/local/VaultDatabase.kt
+          package com.familyvault.app.data.local
+
+          import android.content.Context
+          import androidx.room.Database
+          import androidx.room.Room
+          import androidx.room.RoomDatabase
+          import androidx.sqlite.db.SupportSQLiteDatabase
+          import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
+
+          @Database(
+              entities = [
+                  FamilyMemberEntity::class,
+                  MemberAliasEntity::class,
+                  DocumentEntity::class,
+                  DocumentAttachmentEntity::class,
+                  DocumentHistoryEntity::class
+              ],
+              version = 1,
+              exportSchema = false
+          )
+          abstract class VaultDatabase : RoomDatabase() {
+
+              abstract fun vaultDao(): VaultDao
+
+              companion object {
+                  private const val DB_NAME = "family_vault_v2_encrypted.db"
+
+                  @Volatile
+                  private var INSTANCE: VaultDatabase? = null
+
+                  fun getUnlockedInstance(context: Context, passphraseBytes: ByteArray): VaultDatabase {
+                      return INSTANCE ?: synchronized(this) {
+                          INSTANCE ?: buildEncryptedDatabase(context.applicationContext, passphraseBytes).also {
+                              INSTANCE = it
+                          }
+                      }
+                  }
+
+                  private fun buildEncryptedDatabase(
+                      appContext: Context,
+                      passphraseBytes: ByteArray
+                  ): VaultDatabase {
+                      System.loadLibrary("sqlcipher")
+                      return try {
+                          openDatabaseInternal(appContext, passphraseBytes)
+                      } catch (_: Throwable) {
+                          appContext.deleteDatabase(DB_NAME)
+                          openDatabaseInternal(appContext, passphraseBytes)
+                      }
+                  }
+
+                  private fun openDatabaseInternal(
+                      appContext: Context,
+                      passphraseBytes: ByteArray
+                  ): VaultDatabase {
+                      val keyCopy = passphraseBytes.copyOf()
+                      val factory = SupportOpenHelperFactory(keyCopy)
+                      return Room.databaseBuilder(appContext, VaultDatabase::class.java, DB_NAME)
+                          .openHelperFactory(factory)
+                          .addCallback(Fts5BootstrapCallback())
+                          .fallbackToDestructiveMigrationOnDowngrade()
+                          .build()
+                          .also { db -> db.openHelper.writableDatabase }
+                  }
+
+                  fun lockAndCloseDatabase() {
+                      synchronized(this) {
+                          INSTANCE?.close()
+                          INSTANCE = null
+                      }
+                  }
+              }
+
+              private class Fts5BootstrapCallback : Callback() {
+                  override fun onCreate(db: SupportSQLiteDatabase) {
+                      super.onCreate(db)
+                      try {
+                          db.execSQL(
+                              "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text, content='documents', content_rowid='doc_id', tokenize='trigram');"
+                          )
+                      } catch (_: Throwable) {
+                          db.execSQL(
+                              "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text, content='documents', content_rowid='doc_id');"
+                          )
+                      }
+                      db.execSQL(
+                          "CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN INSERT INTO documents_fts(rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES (new.doc_id, new.name_on_document, new.document_number, new.issuing_authority, new.extra_attributes_json, new.raw_extracted_text); END;"
+                      )
+                      db.execSQL(
+                          "CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN INSERT INTO documents_fts(documents_fts, rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES ('delete', old.doc_id, old.name_on_document, old.document_number, old.issuing_authority, old.extra_attributes_json, old.raw_extracted_text); END;"
+                      )
+                      db.execSQL(
+                          "CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN INSERT INTO documents_fts(documents_fts, rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES ('delete', old.doc_id, old.name_on_document, old.document_number, old.issuing_authority, old.extra_attributes_json, old.raw_extracted_text); INSERT INTO documents_fts(rowid, name_on_document, document_number, issuing_authority, extra_attributes_json, raw_extracted_text) VALUES (new.doc_id, new.name_on_document, new.document_number, new.issuing_authority, new.extra_attributes_json, new.raw_extracted_text); END;"
+                      )
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/domain/NameResolutionEngine.kt
+          package com.familyvault.app.domain
+
+          import com.familyvault.app.data.local.FamilyMemberEntity
+          import kotlin.math.max
+          import kotlin.math.min
+
+          sealed class NameResolutionResult {
+              data class ExactOrAliasMatch(
+                  val member: FamilyMemberEntity,
+                  val matchedVia: String
+              ) : NameResolutionResult()
+
+              data class MinimalMismatchAlert(
+                  val candidateMember: FamilyMemberEntity,
+                  val extractedRawName: String,
+                  val normalizedAliasToSave: String,
+                  val similarityScore: Double,
+                  val editDistance: Int,
+                  val matchReason: String
+              ) : NameResolutionResult()
+
+              data class NewMemberDetected(
+                  val cleanedDisplayName: String,
+                  val sortedTokens: String,
+                  val phoneticCode: String
+              ) : NameResolutionResult()
+          }
+
+          object NameResolutionEngine {
+
+              private val HONORIFICS = setOf(
+                  "MR", "MRS", "MS", "MISS", "SRI", "SMT", "SHREE", "SHRI",
+                  "KUMARI", "KUM", "DR", "PROF", "LATE", "MASTER"
+              )
+
+              private val TOKEN_SYNONYMS = mapOf(
+                  "MOHD" to "MOHAMMED",
+                  "MD" to "MOHAMMED",
+                  "MAHAMMAD" to "MOHAMMED",
+                  "MUHAMMAD" to "MOHAMMED",
+                  "ABD" to "ABDUL"
+              )
+
+              fun normalizeToSortedTokens(rawName: String): String {
+                  return extractCleanTokens(rawName).sorted().joinToString(" ")
+              }
+
+              fun formatCanonicalDisplayName(rawName: String): String {
+                  val tokens = rawName
+                      .replace(Regex("[^A-Za-z.\\s]"), " ")
+                      .trim()
+                      .split(Regex("\\s+"))
+                      .filter { it.isNotBlank() && it.uppercase().removeSuffix(".") !in HONORIFICS }
+
+                  return tokens.joinToString(" ") { token ->
+                      token.lowercase().replaceFirstChar { it.uppercase() }
+                  }
+              }
+
+              private fun extractCleanTokens(rawName: String): List<String> {
+                  return rawName
+                      .uppercase()
+                      .replace(Regex("[^A-Z\\s]"), " ")
+                      .split(Regex("\\s+"))
+                      .map { it.trim() }
+                      .filter { it.isNotEmpty() && it !in HONORIFICS }
+                      .map { TOKEN_SYNONYMS[it] ?: it }
+              }
+
+              fun computePhoneticSignature(rawName: String): String {
+                  val joined = extractCleanTokens(rawName).sorted().joinToString("")
+                  if (joined.isEmpty()) return "UNK"
+                  val firstChar = joined.first()
+                  val normalized = joined
+                      .replace("PH", "F")
+                      .replace("BH", "B")
+                      .replace("DH", "D")
+                      .replace("TH", "T")
+                      .replace("KH", "K")
+                      .replace("GH", "G")
+                      .replace("SH", "S")
+                      .replace("Z", "S")
+                      .replace("V", "W")
+                      .replace("Y", "I")
+                      .replace(Regex("[AEIOUHW]"), "")
+                      .replace(Regex("(.)\\1+"), "$1")
+                  return (firstChar + normalized.drop(1)).take(8)
+              }
+
+              fun resolveIdentity(
+                  extractedRawName: String,
+                  existingMembers: List<FamilyMemberEntity>,
+                  aliasMemberIdIfFound: Long?
+              ): NameResolutionResult {
+                  val cleanedDisplay = formatCanonicalDisplayName(extractedRawName).ifEmpty { "Unknown Name" }
+                  val inputSortedTokens = normalizeToSortedTokens(extractedRawName)
+                  val inputPhonetic = computePhoneticSignature(extractedRawName)
+
+                  if (aliasMemberIdIfFound != null) {
+                      val matchedMember = existingMembers.find { it.memberId == aliasMemberIdIfFound }
+                      if (matchedMember != null) {
+                          return NameResolutionResult.ExactOrAliasMatch(
+                              member = matchedMember,
+                              matchedVia = "Saved Alias ('$cleanedDisplay')"
+                          )
+                      }
+                  }
+
+                  for (member in existingMembers) {
+                      if (member.sortedTokens.equals(inputSortedTokens, ignoreCase = true)) {
+                          return NameResolutionResult.ExactOrAliasMatch(
+                              member = member,
+                              matchedVia = "Exact Canonical Match"
+                          )
+                      }
+                  }
+
+                  val inputTokenList = extractCleanTokens(extractedRawName)
+                  var bestCandidate: FamilyMemberEntity? = null
+                  var bestJaroWinkler = 0.0
+                  var bestEditDistance = Int.MAX_VALUE
+                  var bestReason = ""
+
+                  for (member in existingMembers) {
+                      val targetTokens = member.sortedTokens
+                      val ocrInput = normalizeOcrConfusables(inputSortedTokens)
+                      val ocrTarget = normalizeOcrConfusables(targetTokens)
+
+                      val jwScore = max(
+                          jaroWinklerSimilarity(inputSortedTokens, targetTokens),
+                          jaroWinklerSimilarity(ocrInput, ocrTarget)
+                      )
+                      val editDist = min(
+                          levenshteinDistance(inputSortedTokens, targetTokens),
+                          levenshteinDistance(ocrInput, ocrTarget)
+                      )
+                      val isInitialMatch = checkIndianInitialExpansion(
+                          inputTokenList,
+                          extractCleanTokens(member.canonicalName)
+                      )
+                      val isPhoneticMatch = member.phoneticPrimary == inputPhonetic && jwScore >= 0.78
+
+                      if (isInitialMatch || (editDist <= 2 && targetTokens.length >= 5) || jwScore >= 0.84 || isPhoneticMatch) {
+                          val effectiveScore = when {
+                              isInitialMatch -> max(jwScore, 0.92)
+                              isPhoneticMatch -> max(jwScore, 0.88)
+                              else -> jwScore
+                          }
+                          if (effectiveScore > bestJaroWinkler) {
+                              bestJaroWinkler = effectiveScore
+                              bestEditDistance = editDist
+                              bestCandidate = member
+                              bestReason = when {
+                                  isInitialMatch -> "Initial expansion match ('$cleanedDisplay' <-> '${member.canonicalName}')"
+                                  editDist <= 2 -> "Spelling typo detected (Edit distance: $editDist char)"
+                                  isPhoneticMatch -> "Phonetic sound-alike match"
+                                  else -> "Fuzzy similarity (${(effectiveScore * 100).toInt()}%)"
+                              }
+                          }
+                      }
+                  }
+
+                  if (bestCandidate != null) {
+                      return NameResolutionResult.MinimalMismatchAlert(
+                          candidateMember = bestCandidate,
+                          extractedRawName = cleanedDisplay,
+                          normalizedAliasToSave = inputSortedTokens,
+                          similarityScore = bestJaroWinkler,
+                          editDistance = bestEditDistance,
+                          matchReason = bestReason
+                      )
+                  }
+
+                  return NameResolutionResult.NewMemberDetected(
+                      cleanedDisplayName = cleanedDisplay,
+                      sortedTokens = inputSortedTokens,
+                      phoneticCode = inputPhonetic
+                  )
+              }
+
+              private fun checkIndianInitialExpansion(tokensA: List<String>, tokensB: List<String>): Boolean {
+                  if (tokensA.size < 2 || tokensB.size < 2 || tokensA.size != tokensB.size) return false
+                  val fullWordsA = tokensA.filter { it.length > 1 }
+                  val initialsA = tokensA.filter { it.length == 1 }
+                  if (initialsA.isNotEmpty() && fullWordsA.isNotEmpty()) {
+                      val remainingB = tokensB.toMutableList()
+                      for (wordA in fullWordsA) {
+                          val matchIdx = remainingB.indexOfFirst {
+                              levenshteinDistance(wordA, it) <= 1 || jaroWinklerSimilarity(wordA, it) >= 0.88
+                          }
+                          if (matchIdx == -1) return false
+                          remainingB.removeAt(matchIdx)
+                      }
+                      for (initA in initialsA) {
+                          val initIdx = remainingB.indexOfFirst { it.startsWith(initA) }
+                          if (initIdx == -1) return false
+                          remainingB.removeAt(initIdx)
+                      }
+                      return remainingB.isEmpty()
+                  }
+                  return false
+              }
+
+              private fun normalizeOcrConfusables(input: String): String {
+                  return input.replace('0', 'O').replace('1', 'I').replace('L', 'I').replace('5', 'S').replace('8', 'B')
+              }
+
+              fun levenshteinDistance(s1: String, s2: String): Int {
+                  if (s1 == s2) return 0
+                  if (s1.isEmpty()) return s2.length
+                  if (s2.isEmpty()) return s1.length
+                  var prev = IntArray(s2.length + 1) { it }
+                  var curr = IntArray(s2.length + 1)
+                  for (i in 1..s1.length) {
+                      curr[0] = i
+                      for (j in 1..s2.length) {
+                          val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
+                          curr[j] = minOf(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+                      }
+                      val temp = prev; prev = curr; curr = temp
+                  }
+                  return prev[s2.length]
+              }
+
+              fun jaroWinklerSimilarity(s1: String, s2: String): Double {
+                  if (s1 == s2) return 1.0
+                  if (s1.isEmpty() || s2.isEmpty()) return 0.0
+                  val matchDistance = max(s1.length, s2.length) / 2 - 1
+                  val s1Matches = BooleanArray(s1.length)
+                  val s2Matches = BooleanArray(s2.length)
+                  var matches = 0
+                  for (i in s1.indices) {
+                      val start = max(0, i - matchDistance)
+                      val end = min(i + matchDistance + 1, s2.length)
+                      for (j in start until end) {
+                          if (s2Matches[j] || s1[i] != s2[j]) continue
+                          s1Matches[i] = true; s2Matches[j] = true; matches++; break
+                      }
+                  }
+                  if (matches == 0) return 0.0
+                  var t = 0; var k = 0
+                  for (i in s1.indices) {
+                      if (!s1Matches[i]) continue
+                      while (!s2Matches[k]) k++
+                      if (s1[i] != s2[k]) t++
+                      k++
+                  }
+                  val m = matches.toDouble()
+                  val jaro = ((m / s1.length) + (m / s2.length) + ((m - t / 2.0) / m)) / 3.0
+                  var prefix = 0
+                  for (i in 0 until minOf(4, s1.length, s2.length)) {
+                      if (s1[i] == s2[i]) prefix++ else break
+                  }
+                  return jaro + (prefix * 0.1 * (1.0 - jaro))
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/domain/DocumentParserEngine.kt
+          package com.familyvault.app.domain
+
+          import org.json.JSONObject
+
+          data class ParsedDocumentPayload(
+              val docCategory: String,
+              val docSubType: String,
+              val issuingAuthority: String,
+              val extractedName: String,
+              val documentNumber: String,
+              val issueDate: String?,
+              val expiryDate: String?,
+              val linkedMobile: String?,
+              val extraAttributesJson: String,
+              val rawText: String
+          )
+
+          object DocumentParserEngine {
+
+              private val VALID_STATE_CODES = setOf(
+                  "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA", "GJ",
+                  "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH", "ML", "MN", "MP",
+                  "MZ", "NL", "OD", "OR", "PB", "PY", "RJ", "SK", "TN", "TR", "TS", "UK",
+                  "UP", "WB"
+              )
+
+              private val NON_NAME_WORDS = setOf(
+                  "INCOME", "TAX", "DEPARTMENT", "GOVT", "GOVERNMENT", "INDIA", "UNIQUE",
+                  "IDENTIFICATION", "AUTHORITY", "UIDAI", "ELECTION", "COMMISSION", "ELECTOR",
+                  "PHOTO", "IDENTITY", "CARD", "REPUBLIC", "PASSPORT", "DRIVING", "LICENCE",
+                  "LICENSE", "UNION", "KARNATAKA", "STATE", "MOTOR", "VEHICLE", "REGISTRATION",
+                  "CERTIFICATE", "PASSBOOK", "BANK", "BRANCH", "IFSC", "MICR", "ACCOUNT",
+                  "PERMANENT", "NUMBER", "SIGNATURE", "ADDRESS", "DATE", "BIRTH", "VALID",
+                  "TILL", "UPTO", "EXPIRY", "ISSUE", "BLOOD", "GROUP", "ORGAN", "DONOR",
+                  "TAHSILDAR", "REVENUE", "NADA", "KACHERI", "CASTE", "DOMICILE", "MARKS",
+                  "SECONDARY", "EDUCATION", "BOARD", "UNIVERSITY", "EXAMINATION", "RESULT",
+                  "MALE", "FEMALE", "TRANSGENDER", "NATIONALITY", "INDIAN", "HOLDER", "SPECIMEN",
+                  "REL", "PRO", "PROP", "MANSER", "LTD", "LIMITED", "PVT", "PRIVATE", "CORP",
+                  "CORPORATE", "PARK", "ROAD", "BELAPUR", "THANE", "NAVI", "MUMBAI", "CENTRAL",
+                  "CELL", "JIO", "RELIANCE", "THE", "SHOULD", "ALWAYS", "DISPLAYED", "WHILE",
+                  "DUTY", "HEIGHT", "MARK", "MOLE", "FOREHEAD", "SCAR", "LOSS", "REPORTED",
+                  "ISSUING", "ONCE", "FOUND", "PLEASE", "RETURN", "EMERGENCY", "CONTACT",
+                  "NOS", "DOJ", "EC", "NO", "EMP", "CODE", "DESIGNATION"
+              )
+
+              private val TOLL_FREE_OR_PHONE_REGEX = Regex("\\b(1800[\\s-]?[0-9]{3}[\\s-]?[0-9]{4}|[6-9][0-9]{9})\\b")
+              private val PINCODE_REGEX = Regex("\\b([1-8][0-9]{5})\\b")
+
+              private val MONTH_MAP = mapOf(
+                  "JAN" to "01", "FEB" to "02", "MAR" to "03", "APR" to "04",
+                  "MAY" to "05", "JUN" to "06", "JUL" to "07", "AUG" to "08",
+                  "SEP" to "09", "OCT" to "10", "NOV" to "11", "DEC" to "12"
+              )
+
+              fun parseDocumentText(rawInput: String): ParsedDocumentPayload {
+                  val cleanText = rawInput.trim()
+                  val upperText = cleanText.uppercase()
+                  val allLines = cleanText.lines()
+                      .map { it.trim() }
+                      .filter { it.isNotEmpty() && !it.startsWith("---ENHANCED") && !it.startsWith("---SPATIAL") }
+
+                  val mrzParsed = parsePassportMrzIfPresent(allLines)
+
+                  val degarbledPan = findAndDegarblePan(upperText)
+                  val degarbledDl = findAndDegarbleDrivingLicense(upperText)
+                  val degarbledIfsc = findAndDegarbleIfsc(upperText)
+                  val degarbledRd = findAndDegarbleNadaKacheriRd(upperText)
+                  val degarbledEpic = findAndDegarbleVoterEpic(upperText)
+                  val degarbledRc = findAndDegarbleVehicleRc(upperText)
+                  val maskedUid = findVerifiedMaskedUid(upperText)
+                  val employeeOrCardNo = findEmployeeOrInstitutionalId(upperText, allLines)
+
+                  val (category, subType, authority) = classifyDocument(
+                      upperText = upperText,
+                      lines = allLines,
+                      hasPan = degarbledPan != null,
+                      hasDl = degarbledDl != null,
+                      hasIfsc = degarbledIfsc != null,
+                      hasRd = degarbledRd != null,
+                      hasMrz = mrzParsed != null,
+                      hasEpic = degarbledEpic != null,
+                      hasRc = degarbledRc != null,
+                      hasUid = maskedUid != null,
+                      hasEmpId = employeeOrCardNo != null
+                  )
+
+                  val docNumber = when (subType) {
+                      "PAN Card" -> degarbledPan ?: extractFallbackNumber(upperText)
+                      "Driving License" -> degarbledDl ?: extractFallbackNumber(upperText)
+                      "Indian Passport" -> mrzParsed?.passportNo ?: findPassportNumber(upperText) ?: extractFallbackNumber(upperText)
+                      "Nada Kacheri Certificate" -> degarbledRd ?: extractFallbackNumber(upperText)
+                      "Voter ID (EPIC)" -> degarbledEpic ?: extractFallbackNumber(upperText)
+                      "Vehicle RC Card" -> degarbledRc ?: extractFallbackNumber(upperText)
+                      "Bank Passbook" -> extractBankAccountNumber(upperText) ?: degarbledIfsc ?: extractFallbackNumber(upperText)
+                      "Academic Marks Card" -> extractMarksRegisterNumber(upperText) ?: extractFallbackNumber(upperText)
+                      "National ID Card" -> maskedUid ?: extractFallbackNumber(upperText)
+                      "Employee / Institutional ID" -> employeeOrCardNo ?: extractFallbackNumber(upperText)
+                      else -> degarbledPan ?: degarbledDl ?: degarbledRd ?: degarbledEpic ?: maskedUid ?: employeeOrCardNo ?: extractFallbackNumber(upperText)
+                  }
+
+                  val extractedName = mrzParsed?.fullName
+                      ?: extractTaglessOrLabeledPersonName(allLines, docNumber)
+
+                  val (issueDate, expiryDate, dob) = extractAllDocumentDates(
+                      lines = allLines,
+                      mrzDob = mrzParsed?.dob,
+                      mrzExpiry = mrzParsed?.expiryDate
+                  )
+
+                  val linkedMobile = TOLL_FREE_OR_PHONE_REGEX.find(cleanText)?.groupValues?.get(1)
+                  val extraJson = buildExtraAttributesJson(
+                      upperText = upperText,
+                      lines = allLines,
+                      dob = dob,
+                      ifsc = degarbledIfsc,
+                      primaryDocNo = docNumber
+                  )
+
+                  return ParsedDocumentPayload(
+                      docCategory = category,
+                      docSubType = subType,
+                      issuingAuthority = authority,
+                      extractedName = extractedName,
+                      documentNumber = docNumber,
+                      issueDate = issueDate,
+                      expiryDate = expiryDate,
+                      linkedMobile = linkedMobile,
+                      extraAttributesJson = extraJson,
+                      rawText = cleanText
+                  )
+              }
+
+              private fun classifyDocument(
+                  upperText: String,
+                  lines: List<String>,
+                  hasPan: Boolean,
+                  hasDl: Boolean,
+                  hasIfsc: Boolean,
+                  hasRd: Boolean,
+                  hasMrz: Boolean,
+                  hasEpic: Boolean,
+                  hasRc: Boolean,
+                  hasUid: Boolean,
+                  hasEmpId: Boolean
+              ): Triple<String, String, String> {
+                  return when {
+                      upperText.contains("INCOME TAX") || upperText.contains("PERMANENT ACCOUNT") || hasPan ->
+                          Triple("ID_CARD", "PAN Card", "Income Tax Department, Govt. of India")
+
+                      upperText.contains("DRIVING LICENCE") || upperText.contains("DRIVING LICENSE") || hasDl ->
+                          Triple("ID_CARD", "Driving License", "Regional Transport Office (RTO)")
+
+                      hasMrz || (upperText.contains("REPUBLIC OF INDIA") && upperText.contains("PASSPORT")) ->
+                          Triple("PASSPORT", "Indian Passport", "Ministry of External Affairs, Govt. of India")
+
+                      upperText.contains("NADA KACHERI") || upperText.contains("TAHSILDAR") || hasRd ->
+                          Triple("GOVT_CERT", "Nada Kacheri Certificate", "Revenue Department (Nada Kacheri)")
+
+                      upperText.contains("ELECTION COMMISSION") || upperText.contains("ELECTOR") || hasEpic ->
+                          Triple("ID_CARD", "Voter ID (EPIC)", "Election Commission of India")
+
+                      upperText.contains("REGISTRATION CERTIFICATE") || upperText.contains("CHASSIS NO") || hasRc ->
+                          Triple("ID_CARD", "Vehicle RC Card", "Transport Department (RTO)")
+
+                      upperText.contains("PASSBOOK") || upperText.contains("IFSC") || hasIfsc ->
+                          Triple("BANK_PASSBOOK", "Bank Passbook", detectBankAuthority(upperText))
+
+                      upperText.contains("MARKS") || upperText.contains("SECONDARY EDUCATION") ||
+                          upperText.contains("UNIVERSITY") || upperText.contains("KSEAB") || upperText.contains("SSLC") ->
+                          Triple("MARKS_CARD", "Academic Marks Card", "Examination Board / University")
+
+                      upperText.contains("UNIQUE IDENTIFICATION") || upperText.contains("UIDAI") ||
+                          upperText.contains("QR_UID_LAST4") || hasUid ->
+                          Triple("ID_CARD", "National ID Card", "Unique Identification Authority of India")
+
+                      upperText.contains("EC NO") || upperText.contains("EMP NO") || upperText.contains("EMPLOYEE") ||
+                          upperText.contains("WHILE ON DUTY") || upperText.contains("ID CARD CELL") ||
+                          upperText.contains("DOJ:") || upperText.contains("ID MARK:") || hasEmpId ->
+                          Triple("ID_CARD", "Employee / Institutional ID", detectOrganizationAuthority(lines))
+
+                      else ->
+                          Triple("GOVT_CERT", "General Document", detectOrganizationAuthority(lines))
+                  }
+              }
+
+              private fun detectOrganizationAuthority(lines: List<String>): String {
+                  val orgCandidates = mutableListOf<String>()
+                  val orgRegex = Regex(
+                      "\\b(LTD|LIMITED|PVT|CORPORATE|CORP|RELIANCE|JIO|INSTITUTE|COLLEGE|HOSPITAL|TRUST|AUTHORITY|DEPARTMENT|MINISTRY)\\b",
+                      RegexOption.IGNORE_CASE
+                  )
+                  for (line in lines) {
+                      if (orgRegex.containsMatchIn(line) &&
+                          !line.uppercase().contains("LOSS OF CARD") &&
+                          !line.uppercase().contains("SIGNATURE") &&
+                          !line.startsWith("SPATIAL_") &&
+                          line.length in 4..55
+                      ) {
+                          orgCandidates.add(line.trim().trimEnd(',', '.'))
+                      }
+                  }
+                  return if (orgCandidates.isNotEmpty()) {
+                      orgCandidates.distinct().take(2).joinToString(" • ")
+                  } else {
+                      "Government / Institutional Authority"
+                  }
+              }
+
+              private fun findEmployeeOrInstitutionalId(upperText: String, lines: List<String>): String? {
+                  val labeledIdRegex = Regex(
+                      "(?:EC\\s*NO|EMP(?:LOYEE)?\\s*(?:NO|ID|CODE)|BADGE\\s*NO|STAFF\\s*NO|ID\\s*NO|PRAN|UAN|PPO\\s*NO|CARD\\s*NO)[\\s.:;-]*([A-Z0-9-]{5,15})"
+                  )
+                  labeledIdRegex.find(upperText)?.let { return it.groupValues[1].trim() }
+
+                  val standaloneNumbers = lines.mapNotNull { line ->
+                      val cleaned = line.trim()
+                      if (Regex("^[0-9]{6,10}$").matches(cleaned)) cleaned else null
+                  }
+                  if (standaloneNumbers.isNotEmpty()) {
+                      return standaloneNumbers.last()
+                  }
+                  return null
+              }
+
+              private fun extractTaglessOrLabeledPersonName(lines: List<String>, extractedDocNumber: String): String {
+                  val filteredLines = lines.filter { !it.startsWith("SPATIAL_BADGE_NAME") }
+
+                  for (line in lines) {
+                      val qrMatch = Regex("^QR_NAME\\s*:\\s*(.+)$", RegexOption.IGNORE_CASE).find(line)
+                      if (qrMatch != null) {
+                          val cleaned = sanitizeExtractedName(qrMatch.groupValues[1])
+                          if (isValidHumanName(cleaned)) return formatTitleCase(cleaned)
+                      }
+                  }
+
+                  val primaryNameRegex = Regex(
+                      "^(?!.*(?:FATHER|MOTHER|HUSBAND|WIFE|SPOUSE|GUARDIAN|BANK|BRANCH|AUTHORITY))(?:CANDIDATE'?S?\\s*NAME|STUDENT'?S?\\s*NAME|ACCOUNT\\s*HOLDER(?:\\s*NAME)?|ELECTOR'?S?\\s*NAME|APPLICANT'?S?\\s*NAME|EMPLOYEE\\s*NAME|FULL\\s*NAME|GIVEN\\s*NAME|NAME)\\s*[:.;-]+\\s*(.+)$",
+                      RegexOption.IGNORE_CASE
+                  )
+                  for (line in filteredLines) {
+                      val match = primaryNameRegex.find(line)
+                      if (match != null) {
+                          val rawValue = match.groupValues[1].split("   ").first()
+                          val cleaned = sanitizeExtractedName(rawValue)
+                          if (isValidHumanName(cleaned)) return formatTitleCase(cleaned)
+                      }
+                  }
+
+                  for (line in lines) {
+                      if (line.startsWith("SPATIAL_BADGE_NAME :")) {
+                          val candidate = sanitizeExtractedName(line.substringAfter(":").trim())
+                          if (isValidHumanName(candidate)) return formatTitleCase(candidate)
+                      }
+                  }
+
+                  for (i in filteredLines.indices) {
+                      val lineClean = filteredLines[i].trim()
+                      val isIdLine = (extractedDocNumber != "UNPARSED-NO" && lineClean == extractedDocNumber) ||
+                          Regex("^[0-9]{6,12}$").matches(lineClean)
+
+                      if (isIdLine && i >= 1) {
+                          val nameTokensAbove = mutableListOf<String>()
+                          var backIdx = i - 1
+                          while (backIdx >= 0 && nameTokensAbove.size < 3) {
+                              val prevLine = filteredLines[backIdx].trim()
+                              if (isSingleOrMultiWordTaglessNameLine(prevLine)) {
+                                  nameTokensAbove.add(0, prevLine)
+                                  backIdx--
+                              } else {
+                                  break
+                              }
+                          }
+                          if (nameTokensAbove.isNotEmpty()) {
+                              val combined = sanitizeExtractedName(nameTokensAbove.joinToString(" "))
+                              if (isValidHumanName(combined)) return formatTitleCase(combined)
+                          }
+                      }
+                  }
+
+                  for (i in filteredLines.indices) {
+                      val upper = filteredLines[i].uppercase()
+                      if ((upper.contains("FATHER") || upper.startsWith("S/O") || upper.startsWith("D/O") || upper.startsWith("W/O") ||
+                              upper.contains("DOB") || upper.contains("DATE OF BIRTH")) && i >= 1
+                      ) {
+                          val nameParts = mutableListOf<String>()
+                          var backIdx = i - 1
+                          while (backIdx >= 0 && nameParts.size < 2) {
+                              val prev = filteredLines[backIdx].trim()
+                              if (isSingleOrMultiWordTaglessNameLine(prev)) {
+                                  nameParts.add(0, prev)
+                                  backIdx--
+                              } else {
+                                  break
+                              }
+                          }
+                          if (nameParts.isNotEmpty()) {
+                              val combined = sanitizeExtractedName(nameParts.joinToString(" "))
+                              if (isValidHumanName(combined)) return formatTitleCase(combined)
+                          }
+                      }
+                  }
+
+                  var i = 0
+                  while (i < filteredLines.size) {
+                      val line = filteredLines[i].trim()
+                      if (isSingleOrMultiWordTaglessNameLine(line)) {
+                          val cluster = mutableListOf(line)
+                          var nextIdx = i + 1
+                          while (nextIdx < filteredLines.size && cluster.size < 3) {
+                              val nextLine = filteredLines[nextIdx].trim()
+                              if (isSingleOrMultiWordTaglessNameLine(nextLine)) {
+                                  cluster.add(nextLine)
+                                  nextIdx++
+                              } else {
+                                  break
+                              }
+                          }
+                          val combined = sanitizeExtractedName(cluster.joinToString(" "))
+                          val wordCount = combined.split("\\s+".toRegex()).size
+                          if (wordCount in 2..4 && isValidHumanName(combined)) {
+                              return formatTitleCase(combined)
+                          }
+                          i = nextIdx
+                      } else {
+                          i++
+                      }
+                  }
+
+                  return "Unknown Member"
+              }
+
+              private fun isSingleOrMultiWordTaglessNameLine(line: String): Boolean {
+                  val trimmed = line.trim()
+                  if (trimmed.length !in 3..35) return false
+                  if (trimmed.contains(":")) return false
+                  if (!Regex("^[A-Za-z.\\s]+$").matches(trimmed)) return false
+
+                  val words = trimmed.uppercase().replace(".", "").split("\\s+".toRegex()).filter { it.isNotEmpty() }
+                  if (words.isEmpty() || words.size > 4) return false
+                  if (words.any { it in NON_NAME_WORDS || it.length < 2 }) return false
+
+                  val vowels = setOf('A', 'E', 'I', 'O', 'U', 'Y')
+                  if (words.any { w -> w.length >= 3 && w.none { c -> c in vowels } }) return false
+                  return true
+              }
+
+              private fun sanitizeExtractedName(raw: String): String {
+                  return raw
+                      .replace(Regex("^(?:NAME|MR|MRS|MS|SRI|SMT|SHRI|KUMARI|DR)\\.?\\s*[:.-]?\\s*", RegexOption.IGNORE_CASE), "")
+                      .replace(Regex("[^A-Za-z.\\s]"), " ")
+                      .replace(Regex("\\s+"), " ")
+                      .trim()
+              }
+
+              private fun isValidHumanName(candidate: String): Boolean {
+                  if (candidate.length < 3 || candidate.length > 45) return false
+                  val words = candidate.uppercase().replace(".", "").split("\\s+".toRegex()).filter { it.isNotEmpty() }
+                  if (words.isEmpty() || words.size > 5) return false
+                  if (words.any { it in NON_NAME_WORDS }) return false
+                  val vowels = setOf('A', 'E', 'I', 'O', 'U', 'Y')
+                  val longWords = words.filter { it.length >= 3 }
+                  if (longWords.isEmpty() || longWords.any { w -> w.none { c -> c in vowels } }) return false
+                  return true
+              }
+
+              private fun formatTitleCase(name: String): String {
+                  return name.split("\\s+".toRegex())
+                      .filter { it.isNotBlank() }
+                      .joinToString(" ") { word ->
+                          word.lowercase().replaceFirstChar { it.uppercase() }
+                      }
+              }
+
+              private fun extractAllDocumentDates(
+                  lines: List<String>,
+                  mrzDob: String?,
+                  mrzExpiry: String?
+              ): Triple<String?, String?, String?> {
+                  var issueDate: String? = null
+                  var expiryDate: String? = mrzExpiry
+                  var dob: String? = mrzDob
+
+                  val numericDateRegex = Regex("\\b([0-3][0-9O])[/.\\s-]([0-1][0-9O])[/.\\s-](19[0-9]{2}|20[0-9]{2})\\b")
+                  val textMonthDateRegex = Regex(
+                      "\\b([0-3]?[0-9])[-\\s/]+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*[-\\s/,]+(19[0-9]{2}|20[0-9]{2})\\b",
+                      RegexOption.IGNORE_CASE
+                  )
+
+                  val allChronologicalDates = mutableListOf<Pair<Int, String>>()
+
+                  for (i in lines.indices) {
+                      val line = lines[i]
+                      val upper = line.uppercase()
+                      val prevUpper = if (i > 0) lines[i - 1].uppercase() else ""
+                      val contextUpper = "$prevUpper $upper"
+
+                      if (upper.startsWith("QR_DOB")) {
+                          dob = line.substringAfter(":").trim()
+                          continue
+                      }
+
+                      val lineDates = mutableListOf<Pair<Int, String>>()
+
+                      numericDateRegex.findAll(line).forEach { m ->
+                          val dd = m.groupValues[1].replace('O', '0')
+                          val mm = m.groupValues[2].replace('O', '0')
+                          val yyyy = m.groupValues[3]
+                          val yearInt = yyyy.toIntOrNull() ?: 0
+                          val monthInt = mm.toIntOrNull() ?: 0
+                          val dayInt = dd.toIntOrNull() ?: 0
+                          if (yearInt in 1920..2065 && monthInt in 1..12 && dayInt in 1..31) {
+                              val iso = "$yyyy-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}"
+                              lineDates.add(yearInt to iso)
+                              allChronologicalDates.add(yearInt to iso)
+                          }
+                      }
+
+                      textMonthDateRegex.findAll(line).forEach { m ->
+                          val dd = m.groupValues[1].padStart(2, '0')
+                          val mon = MONTH_MAP[m.groupValues[2].uppercase().take(3)] ?: "01"
+                          val yyyy = m.groupValues[3]
+                          val yearInt = yyyy.toIntOrNull() ?: 0
+                          if (yearInt in 1920..2065) {
+                              val iso = "$yyyy-$mon-$dd"
+                              lineDates.add(yearInt to iso)
+                              allChronologicalDates.add(yearInt to iso)
+                          }
+                      }
+
+                      if (lineDates.isEmpty()) continue
+
+                      when {
+                          contextUpper.contains("EXPIR") || contextUpper.contains("VALID TILL") ||
+                              contextUpper.contains("VALID UPTO") || contextUpper.contains("VALIDITY") -> {
+                              expiryDate = lineDates.maxByOrNull { it.first }?.second
+                          }
+                          contextUpper.contains("DOB") || contextUpper.contains("BIRTH") -> {
+                              dob = lineDates.minByOrNull { it.first }?.second
+                          }
+                          contextUpper.contains("DOJ") || contextUpper.contains("JOINING") ||
+                              contextUpper.contains("ISSUE") || contextUpper.contains("DOI") ||
+                              contextUpper.contains("REGN DATE") -> {
+                              issueDate = lineDates.first().second
+                          }
+                      }
+                  }
+
+                  if (expiryDate == null) {
+                      expiryDate = allChronologicalDates.filter { it.first >= 2027 }.maxByOrNull { it.first }?.second
+                  }
+                  if (dob == null) {
+                      dob = allChronologicalDates.filter { it.first in 1930..2008 }.minByOrNull { it.first }?.second
+                  }
+                  if (issueDate == null) {
+                      issueDate = allChronologicalDates
+                          .map { it.second }
+                          .firstOrNull { it != dob && it != expiryDate }
+                  }
+
+                  return Triple(issueDate, expiryDate, dob)
+              }
+
+              private fun buildExtraAttributesJson(
+                  upperText: String,
+                  lines: List<String>,
+                  dob: String?,
+                  ifsc: String?,
+                  primaryDocNo: String
+              ): String {
+                  val json = JSONObject()
+                  if (dob != null) json.put("DOB", dob)
+                  if (ifsc != null) json.put("IFSC", ifsc)
+
+                  Regex("(?:BLOOD\\s*GROUP|B\\.?G\\.?)\\s*[:.-]*\\s*((?:A|B|AB|O)[+-])", RegexOption.IGNORE_CASE)
+                      .find(upperText)?.let { json.put("Blood Group", it.groupValues[1].uppercase()) }
+
+                  Regex("(?:HEIGHT)\\s*[:.-]*\\s*([0-9]{2,3}(?:\\s*CM)?)", RegexOption.IGNORE_CASE)
+                      .find(upperText)?.let { json.put("Height", it.groupValues[1].trim()) }
+
+                  Regex("(?:DOJ|DATE\\s*OF\\s*JOINING)\\s*[:.-]*\\s*([0-9]{2}[/-][0-9]{2}[/-][0-9]{4})", RegexOption.IGNORE_CASE)
+                      .find(upperText)?.let { json.put("DOJ", it.groupValues[1].trim()) }
+
+                  for (line in lines) {
+                      val markMatch = Regex("(?:ID\\s*MARK|IDENTIFICATION\\s*MARK)\\s*[:.-]+\\s*(.+)$", RegexOption.IGNORE_CASE).find(line)
+                      if (markMatch != null) {
+                          json.put("ID Mark", markMatch.groupValues[1].trim())
+                      }
+                      val fatherMatch = Regex(
+                          "^(?:FATHER'?S?\\s*NAME|MOTHER'?S?\\s*NAME|HUSBAND'?S?\\s*NAME|CARE\\s*OF|S/O|D/O|W/O)\\s*[:.-]+\\s*(.+)$",
+                          RegexOption.IGNORE_CASE
+                      ).find(line)
+                      if (fatherMatch != null) {
+                          val cleaned = sanitizeExtractedName(fatherMatch.groupValues[1].split("   ").first())
+                          if (cleaned.length >= 3) json.put("Relation", cleaned)
+                      }
+                      val pctMatch = Regex("(?:PERCENTAGE|RESULT|CGPA|TOTAL\\s*MARKS)\\s*[:.-]+\\s*([0-9.]+%?)", RegexOption.IGNORE_CASE).find(line)
+                      if (pctMatch != null) {
+                          json.put("Score", pctMatch.groupValues[1].trim())
+                      }
+                  }
+
+                  TOLL_FREE_OR_PHONE_REGEX.find(upperText)?.let {
+                      json.put("Emergency/Phone", it.groupValues[1].trim())
+                  }
+
+                  lines.map { it.trim() }
+                      .firstOrNull { Regex("^[0-9]{5,8}$").matches(it) && it != primaryDocNo }
+                      ?.let { json.put("Card Serial", it) }
+
+                  PINCODE_REGEX.find(upperText)?.value?.let { json.put("Pincode", it) }
+                  return json.toString()
+              }
+
+              private fun findAndDegarblePan(upperText: String): String? {
+                  val tokens = Regex("\\b[A-Z0-9]{10}\\b").findAll(upperText).map { it.value }.toList()
+                  for (token in tokens) {
+                      val chars = token.toCharArray()
+                      for (i in 0..4) chars[i] = digitToLetterConfusable(chars[i])
+                      for (i in 5..8) chars[i] = letterToDigitConfusable(chars[i])
+                      chars[9] = digitToLetterConfusable(chars[9])
+                      val candidate = String(chars)
+                      val validEntityCode = candidate[3] in setOf('P', 'C', 'H', 'F', 'A', 'T', 'B', 'L', 'J', 'G')
+                      if (Regex("^[A-Z]{5}[0-9]{4}[A-Z]$").matches(candidate) && validEntityCode) {
+                          return candidate
+                      }
+                  }
+                  return null
+              }
+
+              private fun findAndDegarbleDrivingLicense(upperText: String): String? {
+                  val dlPattern = Regex("\\b([A-Z0-9]{2})[-\\s]?([0-9OIZSB]{2})[-\\s]?((?:19|20)[0-9OIZSB]{2})[-\\s]?([0-9OIZSB]{7})\\b")
+                  for (match in dlPattern.findAll(upperText)) {
+                      val rawState = match.groupValues[1].map { digitToLetterConfusable(it) }.joinToString("")
+                      if (rawState !in VALID_STATE_CODES) continue
+                      val rto = match.groupValues[2].map { letterToDigitConfusable(it) }.joinToString("")
+                      val yr = match.groupValues[3].map { letterToDigitConfusable(it) }.joinToString("")
+                      val serial = match.groupValues[4].map { letterToDigitConfusable(it) }.joinToString("")
+                      if (rto.all { it.isDigit() } && yr.all { it.isDigit() } && serial.all { it.isDigit() }) {
+                          return "$rawState$rto $yr$serial"
+                      }
+                  }
+                  return null
+              }
+
+              private fun findAndDegarbleIfsc(upperText: String): String? {
+                  val labeledMatch = Regex("(?:IFSC(?:\\s*CODE)?)[\\s.:-]*([A-Z0-9]{11})").find(upperText)
+                  val candidates = mutableListOf<String>()
+                  if (labeledMatch != null) candidates.add(labeledMatch.groupValues[1])
+
+                  val knownBanks = listOf("SBIN", "CNRB", "HDFC", "ICIC", "UBIN", "BARB", "PUNB", "KVGB", "AXIS", "IDIB", "BKID", "IOBA", "FDRL", "KKBK", "YESB")
+                  Regex("\\b([A-Z0-9]{11})\\b").findAll(upperText).forEach { m ->
+                      val v = m.value
+                      val prefix = v.take(4).map { digitToLetterConfusable(it) }.joinToString("")
+                      if (prefix in knownBanks) candidates.add(v)
+                  }
+
+                  for (raw in candidates) {
+                      val bank = raw.take(4).map { digitToLetterConfusable(it) }.joinToString("")
+                      val fifth = if (raw[4] == 'O' || raw[4] == 'Q' || raw[4] == 'D') '0' else raw[4]
+                      val branch = raw.substring(5)
+                      if (bank.all { it.isLetter() } && fifth == '0' && branch.all { it.isLetterOrDigit() }) {
+                          return "$bank$fifth$branch"
+                      }
+                  }
+                  return null
+              }
+
+              private fun findAndDegarbleNadaKacheriRd(upperText: String): String? {
+                  val match = Regex("\\bR[D0O]([0-9OIZSB]{13})\\b").find(upperText) ?: return null
+                  val digits = match.groupValues[1].map { letterToDigitConfusable(it) }.joinToString("")
+                  return if (digits.all { it.isDigit() }) "RD$digits" else null
+              }
+
+              private fun findAndDegarbleVoterEpic(upperText: String): String? {
+                  if (!upperText.contains("ELECTION") && !upperText.contains("ELECTOR")) return null
+                  val tokens = Regex("\\b([A-Z]{3}[0-9OIZSB]{7})\\b").findAll(upperText)
+                  for (m in tokens) {
+                      val raw = m.value
+                      val prefix = raw.take(3)
+                      val digits = raw.substring(3).map { letterToDigitConfusable(it) }.joinToString("")
+                      if (digits.all { it.isDigit() }) return "$prefix$digits"
+                  }
+                  return null
+              }
+
+              private fun findAndDegarbleVehicleRc(upperText: String): String? {
+                  if (!upperText.contains("REGISTRATION") && !upperText.contains("CHASSIS") && !upperText.contains("ENGINE")) return null
+                  val rcRegex = Regex("\\b([A-Z]{2})[-\\s]?([0-9]{2})[-\\s]?([A-Z]{1,3})[-\\s]?([0-9]{4})\\b")
+                  val match = rcRegex.find(upperText) ?: return null
+                  val state = match.groupValues[1]
+                  if (state !in VALID_STATE_CODES) return null
+                  return "${match.groupValues[1]}${match.groupValues[2]}${match.groupValues[3]}${match.groupValues[4]}"
+              }
+
+              private fun findVerifiedMaskedUid(upperText: String): String? {
+                  Regex("QR_UID_LAST4\\s*:\\s*([0-9]{4})").find(upperText)?.let {
+                      return "XXXX-XXXX-${it.groupValues[1]}"
+                  }
+                  val twelveDigitPattern = Regex("\\b([2-9][0-9OIZSB]{3})[\\s-]?([0-9OIZSB]{4})[\\s-]?([0-9OIZSB]{4})\\b")
+                  for (m in twelveDigitPattern.findAll(upperText)) {
+                      val raw = (m.groupValues[1] + m.groupValues[2] + m.groupValues[3])
+                          .map { letterToDigitConfusable(it) }
+                          .joinToString("")
+                      if (raw.length == 12 && raw.all { it.isDigit() } && validateVerhoeffChecksum(raw)) {
+                          return "XXXX-XXXX-${raw.takeLast(4)}"
+                      }
+                  }
+                  return null
+              }
+
+              private fun findPassportNumber(upperText: String): String? {
+                  return Regex("\\b([A-PR-WYa-pr-wy][1-9][0-9]{6})\\b").find(upperText)?.value
+              }
+
+              private fun extractBankAccountNumber(upperText: String): String? {
+                  val labeled = Regex("(?:A/C\\s*NO|ACCOUNT\\s*NO|ACC\\s*NO|A/C\\s*NUMBER)[\\s.:-]*([0-9]{9,18})").find(upperText)
+                  if (labeled != null) return labeled.groupValues[1]
+                  return Regex("\\b([0-9]{11,16})\\b").findAll(upperText)
+                      .map { it.value }
+                      .firstOrNull { !validateVerhoeffChecksum(it) }
+              }
+
+              private fun extractMarksRegisterNumber(upperText: String): String? {
+                  val regMatch = Regex("(?:REG\\.?\\s*NO|REGISTER\\s*NO|ROLL\\s*NO|STUDENT\\s*ID)[\\s.:-]*([A-Z0-9]{6,15})").find(upperText)
+                  return regMatch?.groupValues?.get(1)
+              }
+
+              private fun extractFallbackNumber(upperText: String): String {
+                  val genericNo = Regex("(?:EC\\s*NO|EMP\\s*NO|DOC\\s*NO|CERT\\s*NO|CERTIFICATE\\s*NO|LICENCE\\s*NO|ID\\s*NO|NUMBER)[\\s.:-]*([A-Z0-9/-]{5,20})")
+                      .find(upperText)
+                  if (genericNo != null) return genericNo.groupValues[1]
+                  val numericToken = Regex("\\b([0-9]{6,12})\\b").findAll(upperText)
+                      .map { it.value }
+                      .firstOrNull { !it.startsWith("1800") && it.length != 6 }
+                  if (numericToken != null) return numericToken
+                  val alphanumericToken = Regex("\\b([A-Z0-9]{7,15})\\b").findAll(upperText)
+                      .map { it.value }
+                      .firstOrNull { token -> token.any { it.isDigit() } && token.any { it.isLetter() } }
+                  return alphanumericToken ?: "UNPARSED-NO"
+              }
+
+              private data class MrzData(
+                  val fullName: String,
+                  val passportNo: String,
+                  val dob: String?,
+                  val expiryDate: String?
+              )
+
+              private fun parsePassportMrzIfPresent(lines: List<String>): MrzData? {
+                  val cleanLines = lines.map { it.replace("\\s+".toRegex(), "").uppercase() }
+                  val line1Idx = cleanLines.indexOfFirst { it.startsWith("P<IND") && it.length >= 30 }
+                  if (line1Idx == -1) return null
+
+                  val line1 = cleanLines[line1Idx]
+                  val nameSection = line1.substring(5).substringBefore("<<<")
+                  val parts = nameSection.split("<<")
+                  val surname = parts.getOrNull(0)?.replace('<', ' ')?.trim().orEmpty()
+                  val givenName = parts.getOrNull(1)?.replace('<', ' ')?.trim().orEmpty()
+                  val fullName = "$givenName $surname".trim().ifEmpty { "Unknown Member" }
+
+                  val line2 = cleanLines.getOrNull(line1Idx + 1)
+                  if (line2 != null && line2.length >= 28) {
+                      val rawPassNo = line2.substring(0, 9).replace("<", "")
+                      val rawDob = line2.substring(13, 19)
+                      val rawExp = line2.substring(21, 27)
+                      return MrzData(
+                          fullName = formatTitleCase(fullName),
+                          passportNo = rawPassNo,
+                          dob = parseMrzSixDigitDate(rawDob, isExpiry = false),
+                          expiryDate = parseMrzSixDigitDate(rawExp, isExpiry = true)
+                      )
+                  }
+                  return MrzData(fullName = formatTitleCase(fullName), passportNo = "UNPARSED", dob = null, expiryDate = null)
+              }
+
+              private fun parseMrzSixDigitDate(yymmdd: String, isExpiry: Boolean): String? {
+                  val clean = yymmdd.map { letterToDigitConfusable(it) }.joinToString("")
+                  if (clean.length != 6 || !clean.all { it.isDigit() }) return null
+                  val yy = clean.substring(0, 2).toInt()
+                  val mm = clean.substring(2, 4)
+                  val dd = clean.substring(4, 6)
+                  val fullYear = if (isExpiry) {
+                      if (yy <= 65) 2000 + yy else 1900 + yy
+                  } else {
+                      if (yy <= 26) 2000 + yy else 1900 + yy
+                  }
+                  return "$fullYear-$mm-$dd"
+              }
+
+              private fun detectBankAuthority(upperText: String): String {
+                  return when {
+                      upperText.contains("STATE BANK OF INDIA") || upperText.contains("SBIN") -> "State Bank of India (SBI)"
+                      upperText.contains("CANARA BANK") || upperText.contains("CNRB") -> "Canara Bank"
+                      upperText.contains("HDFC BANK") || upperText.contains("HDFC") -> "HDFC Bank"
+                      upperText.contains("ICICI BANK") || upperText.contains("ICIC") -> "ICICI Bank"
+                      upperText.contains("UNION BANK") || upperText.contains("UBIN") -> "Union Bank of India"
+                      upperText.contains("BANK OF BARODA") || upperText.contains("BARB") -> "Bank of Baroda"
+                      upperText.contains("PUNJAB NATIONAL") || upperText.contains("PUNB") -> "Punjab National Bank"
+                      upperText.contains("KARNATAKA VIKAS") || upperText.contains("KVGB") -> "Karnataka Vikas Grameena Bank"
+                      upperText.contains("AXIS BANK") || upperText.contains("UTIB") -> "Axis Bank"
+                      else -> "Banking Institution"
+                  }
+              }
+
+              private fun digitToLetterConfusable(c: Char): Char = when (c) {
+                  '0' -> 'O'
+                  '1' -> 'I'
+                  '2' -> 'Z'
+                  '5' -> 'S'
+                  '8' -> 'B'
+                  '6' -> 'G'
+                  else -> c
+              }
+
+              private fun letterToDigitConfusable(c: Char): Char = when (c) {
+                  'O', 'Q', 'D' -> '0'
+                  'I', 'L' -> '1'
+                  'Z' -> '2'
+                  'S' -> '5'
+                  'B' -> '8'
+                  'G' -> '6'
+                  else -> c
+              }
+
+              fun validateVerhoeffChecksum(digits: String): Boolean {
+                  if (digits.length != 12 || !digits.all { it.isDigit() }) return false
+                  val d = arrayOf(
+                      intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+                      intArrayOf(1, 2, 3, 4, 0, 6, 7, 8, 9, 5),
+                      intArrayOf(2, 3, 4, 0, 1, 7, 8, 9, 5, 6),
+                      intArrayOf(3, 4, 0, 1, 2, 8, 9, 5, 6, 7),
+                      intArrayOf(4, 0, 1, 2, 3, 9, 5, 6, 7, 8),
+                      intArrayOf(5, 9, 8, 7, 6, 0, 4, 3, 2, 1),
+                      intArrayOf(6, 5, 9, 8, 7, 1, 0, 4, 3, 2),
+                      intArrayOf(7, 6, 5, 9, 8, 2, 1, 0, 4, 3),
+                      intArrayOf(8, 7, 6, 5, 9, 3, 2, 1, 0, 4),
+                      intArrayOf(9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+                  )
+                  val p = arrayOf(
+                      intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+                      intArrayOf(1, 5, 7, 6, 2, 8, 3, 0, 9, 4),
+                      intArrayOf(5, 8, 0, 3, 7, 9, 6, 1, 4, 2),
+                      intArrayOf(8, 9, 1, 6, 0, 4, 3, 5, 2, 7),
+                      intArrayOf(9, 4, 5, 3, 1, 2, 6, 8, 7, 0),
+                      intArrayOf(4, 2, 8, 6, 5, 7, 3, 9, 0, 1),
+                      intArrayOf(2, 7, 9, 3, 8, 0, 6, 4, 1, 5),
+                      intArrayOf(7, 0, 4, 6, 9, 1, 3, 2, 5, 8)
+                  )
+                  var c = 0
+                  val reversed = digits.reversed()
+                  for (i in reversed.indices) {
+                      c = d[c][p[i % 8][reversed[i].digitToInt()]]
+                  }
+                  return c == 0
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/scanner/ScanAndVoiceProcessor.kt
+          package com.familyvault.app.scanner
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.ColorMatrix
+          import android.graphics.ColorMatrixColorFilter
+          import android.graphics.Paint
+          import android.graphics.Rect
+          import android.net.Uri
+          import android.os.Build
+          import com.familyvault.app.crypto.VaultCryptoManager
+          import com.familyvault.app.domain.DocumentParserEngine
+          import com.familyvault.app.domain.ParsedDocumentPayload
+          import com.google.android.gms.tasks.Task
+          import com.google.mlkit.vision.barcode.BarcodeScanning
+          import com.google.mlkit.vision.barcode.common.Barcode
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.Text
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.suspendCancellableCoroutine
+          import kotlinx.coroutines.withContext
+          import java.io.ByteArrayInputStream
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+          import kotlin.coroutines.resume
+          import kotlin.coroutines.resumeWithException
+          import kotlin.math.abs
+          import kotlin.math.max
+
+          data class EncryptedPageAttachment(
+              val pageOrder: Int,
+              val encryptedFilePath: String,
+              val sha256Hash: String
+          )
+
+          data class ScanExecutionResult(
+              val parsedPayload: ParsedDocumentPayload,
+              val qualityReport: String,
+              val attachments: List<EncryptedPageAttachment>,
+              val qrVerified: Boolean
+          )
+
+          object ScanAndVoiceProcessor {
+
+              private data class SpatialLine(
+                  val text: String,
+                  val box: Rect,
+                  val centerY: Int,
+                  val centerX: Int,
+                  val height: Int
+              )
+
+              suspend fun processScannedDocumentPages(
+                  context: Context,
+                  imageUris: List<Uri>,
+                  cryptoManager: VaultCryptoManager
+              ): ScanExecutionResult = withContext(Dispatchers.IO) {
+                  val appContext = context.applicationContext
+                  val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                  val barcodeScanner = BarcodeScanning.getClient()
+
+                  val combinedTextBuilder = StringBuilder()
+                  val qrLines = mutableListOf<String>()
+                  val spatialNameHints = mutableListOf<String>()
+                  val qualityReports = mutableListOf<String>()
+                  val encryptedAttachments = mutableListOf<EncryptedPageAttachment>()
+
+                  val vaultDir = File(appContext.filesDir, "vault_encrypted_scans").apply { mkdirs() }
+
+                  for ((index, uri) in imageUris.withIndex()) {
+                      val rawBitmap = appContext.contentResolver.openInputStream(uri)?.use {
+                          BitmapFactory.decodeStream(it)
+                      } ?: continue
+
+                      val normalizedBitmap = scaleToOptimalOcrResolution(rawBitmap)
+                      val contrastBitmap = createHighContrastDocumentBitmap(normalizedBitmap)
+                      qualityReports.add("P${index + 1}: ${evaluateBlurAndGlare(normalizedBitmap)}")
+
+                      val primaryImage = InputImage.fromBitmap(normalizedBitmap, 0)
+                      val enhancedImage = InputImage.fromBitmap(contrastBitmap, 0)
+
+                      val primaryOcr = textRecognizer.process(primaryImage).awaitTask()
+                      val enhancedOcr = textRecognizer.process(enhancedImage).awaitTask()
+
+                      val barcodes: List<Barcode> = try {
+                          barcodeScanner.process(primaryImage).awaitTask()
+                      } catch (_: Throwable) {
+                          emptyList()
+                      }
+
+                      barcodes.mapNotNull { it.rawValue }.forEach { rawQr ->
+                          qrLines.add(decodeGovernmentQrPayload(rawQr))
+                      }
+
+                      val (primarySpatialText, detectedBadgeName) = reconstructSpatialDocumentLines(primaryOcr)
+                      val (enhancedSpatialText, detectedEnhancedName) = reconstructSpatialDocumentLines(enhancedOcr)
+
+                      if (detectedBadgeName != null) spatialNameHints.add(detectedBadgeName)
+                      if (detectedEnhancedName != null) spatialNameHints.add(detectedEnhancedName)
+
+                      combinedTextBuilder.appendLine(primarySpatialText)
+                      if (enhancedSpatialText.isNotBlank()) {
+                          combinedTextBuilder.appendLine("---ENHANCED_PASS---")
+                          combinedTextBuilder.appendLine(enhancedSpatialText)
+                      }
+
+                      val webpStream = ByteArrayOutputStream()
+                      val compressFormat = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          Bitmap.CompressFormat.WEBP_LOSSY
+                      } else {
+                          @Suppress("DEPRECATION")
+                          Bitmap.CompressFormat.WEBP
+                      }
+                      normalizedBitmap.compress(compressFormat, 90, webpStream)
+                      val webpBytes = webpStream.toByteArray()
+
+                      val destFile = File(vaultDir, "scan_${System.currentTimeMillis()}_p${index + 1}.enc")
+                      val sha256 = cryptoManager.encryptStreamToVaultFile(
+                          inputStream = ByteArrayInputStream(webpBytes),
+                          destinationFile = destFile,
+                          associatedData = "VaultScan_v2"
+                      )
+
+                      encryptedAttachments.add(
+                          EncryptedPageAttachment(
+                              pageOrder = index + 1,
+                              encryptedFilePath = destFile.absolutePath,
+                              sha256Hash = sha256
+                          )
+                      )
+                  }
+
+                  val fullMergedText = buildString {
+                      if (qrLines.isNotEmpty()) {
+                          appendLine(qrLines.joinToString("\n"))
+                      }
+                      spatialNameHints.distinct().forEach { hint ->
+                          appendLine("SPATIAL_BADGE_NAME : $hint")
+                      }
+                      append(combinedTextBuilder.toString())
+                  }.trim()
+
+                  val parsed = DocumentParserEngine.parseDocumentText(
+                      fullMergedText.ifEmpty { "General Document\nName : Unknown Member" }
+                  )
+
+                  ScanExecutionResult(
+                      parsedPayload = parsed,
+                      qualityReport = qualityReports.joinToString(" | "),
+                      attachments = encryptedAttachments,
+                      qrVerified = qrLines.isNotEmpty()
+                  )
+              }
+
+              private fun scaleToOptimalOcrResolution(source: Bitmap): Bitmap {
+                  val maxDim = max(source.width, source.height)
+                  if (maxDim in 1400..2400) return source
+                  val scale = 2000f / maxDim.coerceAtLeast(1)
+                  val targetW = (source.width * scale).toInt().coerceAtLeast(1)
+                  val targetH = (source.height * scale).toInt().coerceAtLeast(1)
+                  return Bitmap.createScaledBitmap(source, targetW, targetH, true)
+              }
+
+              private fun createHighContrastDocumentBitmap(source: Bitmap): Bitmap {
+                  val bmp = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+                  val canvas = Canvas(bmp)
+                  val contrast = 1.45f
+                  val translate = -30f
+                  val matrix = ColorMatrix(
+                      floatArrayOf(
+                          0.299f * contrast, 0.587f * contrast, 0.114f * contrast, 0f, translate,
+                          0.299f * contrast, 0.587f * contrast, 0.114f * contrast, 0f, translate,
+                          0.299f * contrast, 0.587f * contrast, 0.114f * contrast, 0f, translate,
+                          0f, 0f, 0f, 1f, 0f
+                      )
+                  )
+                  val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                      colorFilter = ColorMatrixColorFilter(matrix)
+                  }
+                  canvas.drawBitmap(source, 0f, 0f, paint)
+                  return bmp
+              }
+
+              private fun reconstructSpatialDocumentLines(visionText: Text): Pair<String, String?> {
+                  val rawLines = mutableListOf<SpatialLine>()
+
+                  for (block in visionText.textBlocks) {
+                      for (line in block.lines) {
+                          val box = line.boundingBox ?: continue
+                          val cleanWords = line.elements
+                              .filter { el ->
+                                  val conf = el.confidence
+                                  conf == null || conf == 0f || conf >= 0.40f
+                              }
+                              .map { sanitizeOcrToken(it.text) }
+                              .filter { it.isNotBlank() }
+
+                          val joinedLine = cleanWords.joinToString(" ").trim()
+                          if (joinedLine.length >= 2 && joinedLine.any { it.isLetterOrDigit() }) {
+                              rawLines.add(
+                                  SpatialLine(
+                                      text = joinedLine,
+                                      box = box,
+                                      centerY = box.centerY(),
+                                      centerX = box.centerX(),
+                                      height = box.height().coerceAtLeast(12)
+                                  )
+                              )
+                          }
+                      }
+                  }
+
+                  if (rawLines.isEmpty()) return Pair("", null)
+
+                  val sortedByY = rawLines.sortedBy { it.centerY }
+
+                  var badgeNameCandidate: String? = null
+                  val standaloneIdRegex = Regex("^[0-9]{6,12}$")
+                  for (i in sortedByY.indices) {
+                      val current = sortedByY[i]
+                      if (standaloneIdRegex.matches(current.text.replace(" ", ""))) {
+                          val above1 = sortedByY.getOrNull(i - 1)
+                          val above2 = sortedByY.getOrNull(i - 2)
+                          if (above1 != null && isCleanAlphaNameLine(above1.text)) {
+                              badgeNameCandidate = if (above2 != null &&
+                                  isCleanAlphaNameLine(above2.text) &&
+                                  abs(above2.height - above1.height) <= (max(above1.height, above2.height) * 0.45).toInt()
+                              ) {
+                                  "${above2.text} ${above1.text}"
+                              } else {
+                                  above1.text
+                              }
+                              break
+                          }
+                      }
+                  }
+
+                  val mergedRows = mutableListOf<MutableList<SpatialLine>>()
+                  for (line in sortedByY) {
+                      val matchingRow = mergedRows.lastOrNull { row ->
+                          val rowAvgY = row.map { it.centerY }.average().toInt()
+                          val rowAvgH = row.map { it.height }.average().toInt()
+                          abs(line.centerY - rowAvgY) <= (rowAvgH * 0.55).toInt()
+                      }
+                      if (matchingRow != null) {
+                          matchingRow.add(line)
+                      } else {
+                          mergedRows.add(mutableListOf(line))
+                      }
+                  }
+
+                  val horizontalRows = mergedRows.map { row ->
+                      row.sortedBy { it.box.left }.joinToString("   ") { it.text }
+                  }
+
+                  val textOutput = horizontalRows.joinToString("\n").trim()
+                  return Pair(textOutput, badgeNameCandidate)
+              }
+
+              private fun isCleanAlphaNameLine(text: String): Boolean {
+                  val trimmed = text.trim()
+                  if (trimmed.length !in 3..32) return false
+                  if (!Regex("^[A-Za-z.\\s]+$").matches(trimmed)) return false
+                  val upper = trimmed.uppercase()
+                  val blocked = setOf(
+                      "JIO", "RELIANCE", "SIGNATURE", "AUTHORITY", "ISSUING", "HOLDER",
+                      "INDIA", "GOVT", "LIMITED", "LTD", "CORP", "PARK", "ROAD", "MUMBAI"
+                  )
+                  return upper.split("\\s+".toRegex()).none { it in blocked }
+              }
+
+              private fun sanitizeOcrToken(token: String): String {
+                  val stripped = token
+                      .replace(Regex("[^\\x20-\\x7E]"), "")
+                      .replace(Regex("[|~^`•§¤«»©®™]"), "")
+                      .trim()
+                  if (stripped.length == 1 && !stripped[0].isLetterOrDigit()) return ""
+                  return stripped
+              }
+
+              private fun decodeGovernmentQrPayload(rawQr: String): String {
+                  val lines = mutableListOf<String>()
+                  Regex("name\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
+                      lines.add("QR_NAME : ${it.groupValues[1].trim()}")
+                  }
+                  Regex("(?:dob|yob)\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
+                      lines.add("QR_DOB : ${it.groupValues[1].trim()}")
+                  }
+                  Regex("uid\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
+                      val digits = it.groupValues[1].filter { c -> c.isDigit() }
+                      if (digits.length >= 4) {
+                          lines.add("QR_UID_LAST4 : ${digits.takeLast(4)}")
+                      }
+                  }
+                  if (lines.isEmpty()) {
+                      lines.add(rawQr)
+                  }
+                  return lines.joinToString("\n")
+              }
+
+              private fun evaluateBlurAndGlare(bitmap: Bitmap): String {
+                  val scaled = Bitmap.createScaledBitmap(bitmap, 160, 160, true)
+                  val w = scaled.width
+                  val h = scaled.height
+                  val pixels = IntArray(w * h)
+                  scaled.getPixels(pixels, 0, w, 0, 0, w, h)
+
+                  val luma = IntArray(w * h)
+                  var glarePixels = 0
+                  for (i in pixels.indices) {
+                      val p = pixels[i]
+                      val r = (p shr 16) and 0xFF
+                      val g = (p shr 8) and 0xFF
+                      val b = p and 0xFF
+                      val y = (r * 299 + g * 587 + b * 114) / 1000
+                      luma[i] = y
+                      if (y >= 248) glarePixels++
+                  }
+
+                  var laplacianSum = 0.0
+                  var count = 0
+                  for (y in 1 until h - 1) {
+                      for (x in 1 until w - 1) {
+                          val idx = y * w + x
+                          val lap = -4 * luma[idx] + luma[idx - 1] + luma[idx + 1] + luma[idx - w] + luma[idx + w]
+                          laplacianSum += (lap * lap).toDouble()
+                          count++
+                      }
+                  }
+
+                  val sharpnessScore = (laplacianSum / count.coerceAtLeast(1)).toInt()
+                  val glarePct = (glarePixels * 100.0) / pixels.size.coerceAtLeast(1)
+                  val focusLabel = if (sharpnessScore >= 180) "Sharp" else "Soft"
+                  val glareLabel = if (glarePct < 12.0) "Low Glare" else "Glare(${"%.0f".format(glarePct)}%)"
+                  return "$focusLabel/$glareLabel"
+              }
+
+              private suspend fun <T> Task<T>.awaitTask(): T = suspendCancellableCoroutine { cont ->
+                  addOnSuccessListener { result -> if (cont.isActive) cont.resume(result) }
+                  addOnFailureListener { exc -> if (cont.isActive) cont.resumeWithException(exc) }
+                  addOnCanceledListener { if (cont.isActive) cont.cancel() }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/familyvault/app/MainActivity.kt
+          package com.familyvault.app
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.WindowManager
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.IntentSenderRequest
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.biometric.BiometricManager
+          import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
+          import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
+          import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+          import androidx.biometric.BiometricPrompt
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.CheckCircle
+          import androidx.compose.material.icons.filled.Lock
+          import androidx.compose.material.icons.filled.Warning
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+          import androidx.fragment.app.FragmentActivity
+          import androidx.lifecycle.lifecycleScope
+          import com.familyvault.app.crypto.VaultCryptoManager
+          import com.familyvault.app.data.local.*
+          import com.familyvault.app.domain.*
+          import com.familyvault.app.scanner.EncryptedPageAttachment
+          import com.familyvault.app.scanner.ScanAndVoiceProcessor
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : FragmentActivity() {
+
+              private var unlockedDb by mutableStateOf<VaultDatabase?>(null)
+              private var authStatus by mutableStateOf("Vault Locked — Biometric Verification Required")
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.setFlags(
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                      WindowManager.LayoutParams.FLAG_SECURE
+                  )
+
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              val db = unlockedDb
+                              if (db == null) {
+                                  LockedScreen(authStatus) { triggerBiometricPromptSafe() }
+                              } else {
+                                  HighPrecisionOcrWorkbench(
+                                      activity = this@MainActivity,
+                                      db = db,
+                                      onLock = {
+                                          VaultDatabase.lockAndCloseDatabase()
+                                          unlockedDb = null
+                                          authStatus = "Vault Locked & RAM Keys Scrubbed"
+                                   
