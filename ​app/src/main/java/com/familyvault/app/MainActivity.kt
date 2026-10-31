@@ -31,6 +31,7 @@ import androidx.lifecycle.lifecycleScope
 import com.familyvault.app.crypto.VaultCryptoManager
 import com.familyvault.app.data.local.*
 import com.familyvault.app.domain.*
+import com.familyvault.app.scanner.EncryptedPageAttachment
 import com.familyvault.app.scanner.ScanAndVoiceProcessor
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
@@ -171,18 +172,18 @@ private fun HighPrecisionOcrWorkbench(
     val members by dao.observeAllFamilyMembers().collectAsState(initial = emptyList())
     val docs by dao.observeAllDocuments().collectAsState(initial = emptyList())
 
-    var editableName by remember { mutableStateOf("Mohammed Riyaz") }
-    var editableDocSubType by remember { mutableStateOf("PAN Card") }
+    var editableName by remember { mutableStateOf("") }
+    var editableDocSubType by remember { mutableStateOf("") }
     var editableDocCategory by remember { mutableStateOf("ID_CARD") }
-    var editableDocNumber by remember { mutableStateOf("ABCDE1234F") }
-    var editableAuthority by remember { mutableStateOf("Income Tax Department, Govt. of India") }
+    var editableDocNumber by remember { mutableStateOf("") }
+    var editableAuthority by remember { mutableStateOf("") }
     var editableIssueDate by remember { mutableStateOf("") }
     var editableExpiryDate by remember { mutableStateOf("") }
     var editableExtraJson by remember { mutableStateOf("{}") }
     var rawOcrTranscript by remember { mutableStateOf("") }
 
-    var banner by remember { mutableStateOf("Tap 'Scan Government Document' to run Dual-Pass Spatial OCR + QR.") }
-    var pendingEncryptedScanPath by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var banner by remember { mutableStateOf("Tap 'Scan Document (Front & Back)' to auto-detect Name, ID & Tags.") }
+    var pendingAttachments by remember { mutableStateOf<List<EncryptedPageAttachment>>(emptyList()) }
     var mismatchState by remember {
         mutableStateOf<Pair<NameResolutionResult.MinimalMismatchAlert, ParsedDocumentPayload>?>(null)
     }
@@ -192,14 +193,14 @@ private fun HighPrecisionOcrWorkbench(
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(result.data)
-            val firstPageUri = scanResult?.pages?.firstOrNull()?.imageUri
-            if (firstPageUri != null) {
-                banner = "Running Dual-Pass Contrast OCR + Spatial Bounding-Box Alignment + QR..."
+            val pageUris = scanResult?.pages?.map { it.imageUri }.orEmpty()
+            if (pageUris.isNotEmpty()) {
+                banner = "Processing ${pageUris.size} page(s): Tagless Name & Multi-Tag Extraction..."
                 scope.launch {
                     try {
-                        val processed = ScanAndVoiceProcessor.processScannedDocumentUri(
+                        val processed = ScanAndVoiceProcessor.processScannedDocumentPages(
                             context = activity,
-                            imageUri = firstPageUri,
+                            imageUris = pageUris,
                             cryptoManager = cryptoManager
                         )
                         val p = processed.parsedPayload
@@ -212,10 +213,9 @@ private fun HighPrecisionOcrWorkbench(
                         editableExpiryDate = p.expiryDate.orEmpty()
                         editableExtraJson = p.extraAttributesJson
                         rawOcrTranscript = p.rawText
-                        pendingEncryptedScanPath = Pair(processed.encryptedFilePath, processed.sha256Hash)
+                        pendingAttachments = processed.attachments
 
-                        banner = "Extracted: ${p.docSubType} [${processed.qualityReport}] " +
-                            (if (processed.qrVerified) "• QR Verified" else "• Spatial OCR Verified")
+                        banner = "Auto-Detected: '${p.extractedName}' • No: ${p.documentNumber} [${processed.qualityReport}]"
                     } catch (t: Throwable) {
                         banner = "Scan Error: ${t.localizedMessage}"
                     }
@@ -242,7 +242,7 @@ private fun HighPrecisionOcrWorkbench(
                         Icon(Icons.Default.CheckCircle, null, Modifier.size(28.dp))
                         Spacer(Modifier.width(10.dp))
                         Text(
-                            "Dual-Pass Spatial OCR + Positional De-Garbler + QR Active",
+                            "Multi-Page Tagless Name & ID Tag Auto-Detector Active",
                             fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.bodyMedium
                         )
@@ -256,7 +256,7 @@ private fun HighPrecisionOcrWorkbench(
                         try {
                             val options = GmsDocumentScannerOptions.Builder()
                                 .setGalleryImportAllowed(true)
-                                .setPageLimit(2)
+                                .setPageLimit(4)
                                 .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
                                 .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
                                 .build()
@@ -275,7 +275,7 @@ private fun HighPrecisionOcrWorkbench(
                     modifier = Modifier.fillMaxWidth(),
                     contentPadding = PaddingValues(vertical = 14.dp)
                 ) {
-                    Text("Scan Government Document (Camera / Gallery)", fontWeight = FontWeight.Bold)
+                    Text("Scan Document (Front & Back / Gallery)", fontWeight = FontWeight.Bold)
                 }
             }
 
@@ -286,12 +286,12 @@ private fun HighPrecisionOcrWorkbench(
             item {
                 OutlinedCard(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Segregated Database Columns (Verify / Edit Before Save)", fontWeight = FontWeight.Bold)
+                        Text("Auto-Segregated Columns (Editable)", fontWeight = FontWeight.Bold)
 
                         OutlinedTextField(
                             value = editableName,
                             onValueChange = { editableName = it },
-                            label = { Text("Name on Document") },
+                            label = { Text("Detected Holder Name") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true
                         )
@@ -307,7 +307,7 @@ private fun HighPrecisionOcrWorkbench(
                             OutlinedTextField(
                                 value = editableDocNumber,
                                 onValueChange = { editableDocNumber = it },
-                                label = { Text("Document Number") },
+                                label = { Text("ID / EC / Doc No") },
                                 modifier = Modifier.weight(1f),
                                 singleLine = true
                             )
@@ -316,7 +316,7 @@ private fun HighPrecisionOcrWorkbench(
                         OutlinedTextField(
                             value = editableAuthority,
                             onValueChange = { editableAuthority = it },
-                            label = { Text("Issuing Authority") },
+                            label = { Text("Issuing Authority / Organization") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true
                         )
@@ -325,18 +325,26 @@ private fun HighPrecisionOcrWorkbench(
                             OutlinedTextField(
                                 value = editableIssueDate,
                                 onValueChange = { editableIssueDate = it },
-                                label = { Text("Issue Date (YYYY-MM-DD)") },
+                                label = { Text("Issue / DOJ Date") },
                                 modifier = Modifier.weight(1f),
                                 singleLine = true
                             )
                             OutlinedTextField(
                                 value = editableExpiryDate,
                                 onValueChange = { editableExpiryDate = it },
-                                label = { Text("Expiry Date (YYYY-MM-DD)") },
+                                label = { Text("Expiry Date") },
                                 modifier = Modifier.weight(1f),
                                 singleLine = true
                             )
                         }
+
+                        OutlinedTextField(
+                            value = editableExtraJson,
+                            onValueChange = { editableExtraJson = it },
+                            label = { Text("Extracted Tags (Blood Group, Height, ID Mark, DOJ, Phone)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            minLines = 2
+                        )
                     }
                 }
             }
@@ -347,10 +355,10 @@ private fun HighPrecisionOcrWorkbench(
                         scope.launch(Dispatchers.IO) {
                             val currentPayload = ParsedDocumentPayload(
                                 docCategory = editableDocCategory,
-                                docSubType = editableDocSubType.trim(),
-                                issuingAuthority = editableAuthority.trim(),
-                                extractedName = editableName.trim(),
-                                documentNumber = editableDocNumber.trim(),
+                                docSubType = editableDocSubType.trim().ifEmpty { "General Document" },
+                                issuingAuthority = editableAuthority.trim().ifEmpty { "Institutional Authority" },
+                                extractedName = editableName.trim().ifEmpty { "Unknown Member" },
+                                documentNumber = editableDocNumber.trim().ifEmpty { "UNPARSED-NO" },
                                 issueDate = editableIssueDate.trim().ifEmpty { null },
                                 expiryDate = editableExpiryDate.trim().ifEmpty { null },
                                 linkedMobile = null,
@@ -360,7 +368,7 @@ private fun HighPrecisionOcrWorkbench(
                             val norm = NameResolutionEngine.normalizeToSortedTokens(currentPayload.extractedName)
                             val aliasId = dao.findMemberIdByAlias(norm)
                             val existing = dao.getAllFamilyMembersOnce()
-                            val scanAttachment = pendingEncryptedScanPath
+                            val attachmentsToSave = pendingAttachments
 
                             when (val res = NameResolutionEngine.resolveIdentity(currentPayload.extractedName, existing, aliasId)) {
                                 is NameResolutionResult.ExactOrAliasMatch -> {
@@ -377,21 +385,21 @@ private fun HighPrecisionOcrWorkbench(
                                             linkedMobile = currentPayload.linkedMobile,
                                             extraAttributesJson = currentPayload.extraAttributesJson,
                                             rawExtractedText = currentPayload.rawText,
-                                            extractionSource = if (scanAttachment != null) "PRECISION_SCAN" else "MANUAL_VERIFIED"
+                                            extractionSource = "PRECISION_SCAN"
                                         )
                                     )
-                                    if (scanAttachment != null) {
+                                    attachmentsToSave.forEach { att ->
                                         dao.insertAttachment(
                                             DocumentAttachmentEntity(
                                                 docId = docId,
-                                                pageOrder = 1,
+                                                pageOrder = att.pageOrder,
                                                 fileRole = "SCAN_WEBP",
-                                                tinkEncryptedPath = scanAttachment.first,
-                                                sha256Hash = scanAttachment.second
+                                                tinkEncryptedPath = att.encryptedFilePath,
+                                                sha256Hash = att.sha256Hash
                                             )
                                         )
-                                        pendingEncryptedScanPath = null
                                     }
+                                    pendingAttachments = emptyList()
                                     withContext(Dispatchers.Main) {
                                         banner = "Saved to '${res.member.canonicalName}' • $msg"
                                     }
@@ -421,21 +429,21 @@ private fun HighPrecisionOcrWorkbench(
                                             linkedMobile = currentPayload.linkedMobile,
                                             extraAttributesJson = currentPayload.extraAttributesJson,
                                             rawExtractedText = currentPayload.rawText,
-                                            extractionSource = if (scanAttachment != null) "PRECISION_SCAN" else "MANUAL_VERIFIED"
+                                            extractionSource = "PRECISION_SCAN"
                                         )
                                     )
-                                    if (scanAttachment != null) {
+                                    attachmentsToSave.forEach { att ->
                                         dao.insertAttachment(
                                             DocumentAttachmentEntity(
                                                 docId = docId,
-                                                pageOrder = 1,
+                                                pageOrder = att.pageOrder,
                                                 fileRole = "SCAN_WEBP",
-                                                tinkEncryptedPath = scanAttachment.first,
-                                                sha256Hash = scanAttachment.second
+                                                tinkEncryptedPath = att.encryptedFilePath,
+                                                sha256Hash = att.sha256Hash
                                             )
                                         )
-                                        pendingEncryptedScanPath = null
                                     }
+                                    pendingAttachments = emptyList()
                                     withContext(Dispatchers.Main) {
                                         banner = "Created Profile '${res.cleanedDisplayName}' • $msg"
                                     }
@@ -456,12 +464,14 @@ private fun HighPrecisionOcrWorkbench(
                 val mDocs = docs.filter { it.memberId == m.memberId }
                 OutlinedCard(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("👤 ${m.canonicalName}", fontWeight = FontWeight.Bold)
+                        Text("👤 ${m.canonicalName} (Phonetic: ${m.phoneticPrimary})", fontWeight = FontWeight.Bold)
                         mDocs.forEach { d ->
                             Text(
                                 "📄 ${d.docSubType} (v${d.versionNumber}) | No: ${d.documentNumber}" +
+                                    (d.issueDate?.let { " | Issue/DOJ: $it" } ?: "") +
                                     (d.expiryDate?.let { " | Exp: $it" } ?: "") +
-                                    "\n   Authority: ${d.issuingAuthority}",
+                                    "\n   Authority: ${d.issuingAuthority}" +
+                                    "\n   Tags: ${d.extraAttributesJson}",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
