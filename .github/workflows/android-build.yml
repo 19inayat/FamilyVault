@@ -1,4 +1,4 @@
-name: Sprint 3.1 - High-Precision Spatial OCR & QR Build
+name: Sprint 3.2 - Tagless Name & Multi-Tag Precision OCR Build
 
 on:
   push:
@@ -45,8 +45,8 @@ jobs:
                   applicationId = "com.familyvault.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 8
-                  versionName = "0.3.1-precision-ocr"
+                  versionCode = 9
+                  versionName = "0.3.2-tagless-ocr"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -129,6 +129,6 @@ jobs:
       - name: 10. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FamilyVault-Sprint3.1-PrecisionOCR
+          name: FamilyVault-Sprint3.2-TaglessOCR
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
