@@ -12,7 +12,6 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface VaultDao {
-
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertFamilyMember(member: FamilyMemberEntity): Long
 
@@ -49,23 +48,19 @@ interface VaultDao {
     @Query("SELECT * FROM documents WHERE member_id = :memberId ORDER BY doc_category, doc_sub_type")
     fun observeDocumentsForMember(memberId: Long): Flow<List<DocumentEntity>>
 
-    @Query("DELETE FROM family_members WHERE canonical_name = 'Self Profile (Test)'")
+    @Query("DELETE FROM family_members WHERE canonical_name IN ('Self Profile (Test)', 'Unknown Member')")
     suspend fun cleanupSprint1TestProfile()
 
     @RawQuery(observedEntities = [DocumentEntity::class])
     suspend fun executeRawDocumentSearch(query: SupportSQLiteQuery): List<DocumentEntity>
 }
 
-/**
- * Smart Upsert: Prevents duplicate document rows and archives older versions automatically on renewal.
- */
 suspend fun VaultDao.upsertDocumentWithVersionAudit(incoming: DocumentEntity): Pair<Long, String> {
     val existing = findExistingDocumentBySubType(incoming.memberId, incoming.docSubType)
     if (existing == null) {
         val id = insertDocument(incoming)
         return Pair(id, "Inserted v1 (${incoming.docSubType})")
     }
-
     return if (existing.documentNumber.equals(incoming.documentNumber, ignoreCase = true)) {
         val updated = incoming.copy(
             docId = existing.docId,
@@ -73,9 +68,8 @@ suspend fun VaultDao.upsertDocumentWithVersionAudit(incoming: DocumentEntity): P
             updatedAt = System.currentTimeMillis()
         )
         updateDocument(updated)
-        Pair(existing.docId, "Updated existing ${incoming.docSubType} (No duplicate created)")
+        Pair(existing.docId, "Updated existing ${incoming.docSubType}")
     } else {
-        // Document Number changed for same SubType -> Archive old version to history!
         insertDocumentHistory(
             DocumentHistoryEntity(
                 docId = existing.docId,
@@ -87,13 +81,8 @@ suspend fun VaultDao.upsertDocumentWithVersionAudit(incoming: DocumentEntity): P
             )
         )
         val newVersion = existing.versionNumber + 1
-        val renewed = incoming.copy(
-            docId = existing.docId,
-            versionNumber = newVersion,
-            updatedAt = System.currentTimeMillis()
-        )
-        updateDocument(renewed)
-        Pair(existing.docId, "Archived v${existing.versionNumber} & Upgraded to v$newVersion!")
+        updateDocument(incoming.copy(docId = existing.docId, versionNumber = newVersion, updatedAt = System.currentTimeMillis()))
+        Pair(existing.docId, "Archived v${existing.versionNumber} & Upgraded to v$newVersion")
     }
 }
 
@@ -101,21 +90,10 @@ suspend fun VaultDao.searchDocumentsFts5(searchTerm: String): List<DocumentEntit
     val sanitized = searchTerm.replace("\"", "\"\"").trim()
     if (sanitized.isEmpty()) return emptyList()
     return try {
-        val sql = """
-            SELECT d.* FROM documents d
-            INNER JOIN documents_fts fts ON d.doc_id = fts.rowid
-            WHERE documents_fts MATCH '"$sanitized"'
-            ORDER BY d.updated_at DESC
-        """.trimIndent()
+        val sql = "SELECT d.* FROM documents d INNER JOIN documents_fts fts ON d.doc_id = fts.rowid WHERE documents_fts MATCH '\"$sanitized\"' ORDER BY d.updated_at DESC"
         executeRawDocumentSearch(SimpleSQLiteQuery(sql))
     } catch (_: Throwable) {
-        val fallbackSql = """
-            SELECT * FROM documents
-            WHERE raw_extracted_text LIKE '%$sanitized%'
-               OR document_number LIKE '%$sanitized%'
-               OR name_on_document LIKE '%$sanitized%'
-            ORDER BY updated_at DESC
-        """.trimIndent()
+        val fallbackSql = "SELECT * FROM documents WHERE raw_extracted_text LIKE '%$sanitized%' OR document_number LIKE '%$sanitized%' ORDER BY updated_at DESC"
         executeRawDocumentSearch(SimpleSQLiteQuery(fallbackSql))
     }
 }
