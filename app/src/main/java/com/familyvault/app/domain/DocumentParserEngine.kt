@@ -30,13 +30,19 @@ object DocumentParserEngine {
         "MOTOR", "VEHICLE", "REGISTRATION", "CERTIFICATE", "PASSBOOK", "BANK", "BRANCH", "IFSC",
         "MICR", "ACCOUNT", "PERMANENT", "NUMBER", "SIGNATURE", "ADDRESS", "DATE", "BIRTH", "VALID",
         "TILL", "UPTO", "EXPIRY", "ISSUE", "BLOOD", "GROUP", "TAHSILDAR", "REVENUE", "NADA",
-        "KACHERI", "MARKS", "SECONDARY", "EDUCATION", "BOARD", "UNIVERSITY", "MALE", "FEMALE",
-        "HOLDER", "REL", "PRO", "PROP", "MANSER", "LTD", "LIMITED", "PVT", "CORP", "CORPORATE",
-        "PARK", "ROAD", "BELAPUR", "THANE", "NAVI", "MUMBAI", "CENTRAL", "CELL", "JIO", "RELIANCE",
-        "THE", "SHOULD", "ALWAYS", "DISPLAYED", "WHILE", "DUTY", "HEIGHT", "MARK", "MOLE",
-        "FOREHEAD", "LOSS", "REPORTED", "ISSUING", "ONCE", "FOUND", "PLEASE", "RETURN",
-        "EMERGENCY", "CONTACT", "NOS", "DOJ", "EC", "NO", "EMP", "CODE", "NATIONALITY", "INDIAN",
-        "DRUG", "FORM", "SCHEDULE", "RATION", "FOOD", "CIVIL", "SUPPLIES", "AYUSHMAN", "BHARAT"
+        "KACHERI", "NADAKACHERI", "MARKS", "SECONDARY", "EDUCATION", "BOARD", "UNIVERSITY",
+        "MALE", "FEMALE", "HOLDER", "REL", "PRO", "PROP", "MANSER", "LTD", "LIMITED", "PVT",
+        "CORP", "CORPORATE", "PARK", "ROAD", "BELAPUR", "THANE", "NAVI", "MUMBAI", "CENTRAL",
+        "CELL", "JIO", "RELIANCE", "THE", "SHOULD", "ALWAYS", "DISPLAYED", "WHILE", "DUTY",
+        "HEIGHT", "MARK", "MOLE", "FOREHEAD", "LOSS", "REPORTED", "ISSUING", "ONCE", "FOUND",
+        "PLEASE", "RETURN", "EMERGENCY", "CONTACT", "NOS", "DOJ", "EC", "NO", "EMP", "CODE",
+        "NATIONALITY", "INDIAN", "DRUG", "FORM", "SCHEDULE", "RATION", "FOOD", "CIVIL",
+        "SUPPLIES", "AYUSHMAN", "BHARAT", "ABHA", "CGHS", "ECHS", "EPFO", "UAN", "MGNREGA",
+        "UDID", "DISABILITY", "ESHRAM", "SHRAM", "OCI", "OVERSEAS", "CSD", "CANTEEN", "POLICE",
+        "RAILWAY", "RAILWAYS", "APAAR", "UDISE", "SENIOR", "CITIZEN", "SEVA", "SINDHU",
+        "MATSYADHARA", "FISHERIES", "BUNKAR", "WEAVER", "HANDLOOMS", "MARRIAGE", "CASTE",
+        "DOMICILE", "RESIDENCE", "UDYAM", "MSME", "GST", "GSTIN", "INCORPORATION", "PAHANI",
+        "RTC", "BHOOMI", "MUTATION", "SUCCESSION", "HEIR", "KANNADIGA", "ATALJI", "JANASNEHI"
     )
 
     private val PHONE_REGEX = Regex("\\b(1800[\\s-]?[0-9]{3}[\\s-]?[0-9]{4}|[6-9][0-9]{9})\\b")
@@ -45,85 +51,80 @@ object DocumentParserEngine {
     fun parseDocumentText(rawInput: String): ParsedDocumentPayload {
         val cleanText = rawInput.trim()
         val upper = cleanText.uppercase()
-        val allLines = cleanText.lines()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("---ENHANCED") }
+        val allLines = cleanText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val visibleLines = allLines.filter { !it.startsWith("SPATIAL_") && !it.startsWith("QR_") }
 
-        val visibleLines = allLines.filter {
-            !it.startsWith("SPATIAL_") && !it.startsWith("QR_")
-        }
-
-        // 1. Harvest all Dynamic Key-Value Pairs across the document
-        val dynamicPairs = harvestDynamicKeyValuePairs(visibleLines)
-
-        // 2. Specialized Structural Detectors
+        val dynamicPairs = harvestAllKeyValuePairs(visibleLines)
         val mrz = parseMrzIfPresent(visibleLines)
+
+        // Pattern Detectors for National & Karnataka IDs / Certificates
         val pan = findAndDegarblePan(upper)
         val dl = findAndDegarbleDl(upper)
         val ifsc = findAndDegarbleIfsc(upper)
-        val rd = Regex("\\bR[D0O]([0-9OIZSB]{13})\\b").find(upper)?.let {
+        val gstin = Regex("\\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\\b").find(upper)?.value
+        val udyam = Regex("\\b(UDYAM-[A-Z]{2}-[0-9]{2}-[0-9]{7})\\b").find(upper)?.value
+        val cin = Regex("\\b([LU][0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6})\\b").find(upper)?.value
+        val udid = Regex("\\b([A-Z]{2}[0-9]{16})\\b").find(upper)?.value
+        val abha = Regex("\\b([0-9]{2}-[0-9]{4}-[0-9]{4}-[0-9]{4})\\b").find(upper)?.value
+        val mgnrega = Regex("\\b([A-Z]{2}-[0-9]{2}-[0-9]{3}-[0-9]{3}-[0-9]{3}/[0-9A-Z]+)\\b").find(upper)?.value
+        val nadaKacheriRd = Regex("\\bR[D0O]([0-9OIZSB]{13})\\b").find(upper)?.let {
             "RD" + it.groupValues[1].map { c -> letterToDigit(c) }.joinToString("")
         }
         val drugLic = Regex("\\b([A-Z]{3,6}-[0-9]{2}/[0-9]{2,5}(?:\\s*,\\s*[0-9]{2}/[0-9]{2,5})?)\\b").find(upper)?.value
+        val epic = findVoterEpic(upper)
         val rcNo = findVehicleRc(upper)
-        val epicNo = findVoterEpic(upper)
-        val maskedUid = findMaskedUid(upper)
-        val empOrBadgeId = findEmployeeOrInstitutionalId(upper, allLines, dynamicPairs)
+        val maskedUid = findMaskedNationalId(upper)
+        val empOrCardId = findEmployeeOrCardId(upper, allLines, dynamicPairs)
 
-        // 3. Dynamic Document Classification (Covers all Govt, Financial, Academic & Corporate IDs)
-        val (cat, subType, auth) = classifyDocumentDynamic(
+        val (category, subType, authority) = classifyAllIndianAndKarnatakaDocs(
             upper = upper,
             lines = visibleLines,
-            hasPan = pan != null,
-            hasDl = dl != null,
-            hasIfsc = ifsc != null,
-            hasRd = rd != null,
-            hasMrz = mrz != null,
-            hasEpic = epicNo != null,
-            hasRc = rcNo != null,
-            hasUid = maskedUid != null,
-            hasDrugLic = drugLic != null,
-            hasEmpId = empOrBadgeId != null
+            pan = pan,
+            dl = dl,
+            ifsc = ifsc,
+            gstin = gstin,
+            udyam = udyam,
+            cin = cin,
+            udid = udid,
+            abha = abha,
+            mgnrega = mgnrega,
+            rd = nadaKacheriRd,
+            drugLic = drugLic,
+            mrz = mrz != null,
+            epic = epic,
+            rc = rcNo,
+            uid = maskedUid,
+            empId = empOrCardId
         )
 
-        // 4. Resolve Primary Document Number
         val docNo = when (subType) {
-            "PAN Card" -> pan ?: empOrBadgeId ?: "UNPARSED-NO"
-            "Driving License" -> dl ?: empOrBadgeId ?: "UNPARSED-NO"
+            "PAN Card" -> pan ?: empOrCardId ?: "UNPARSED-NO"
+            "Driving Licence (DL)" -> dl ?: empOrCardId ?: "UNPARSED-NO"
             "Indian Passport" -> mrz?.second ?: Regex("\\b([A-Z][0-9]{7})\\b").find(upper)?.value ?: "UNPARSED-NO"
-            "Nada Kacheri Certificate" -> rd ?: empOrBadgeId ?: "UNPARSED-NO"
-            "Voter ID (EPIC)" -> epicNo ?: empOrBadgeId ?: "UNPARSED-NO"
-            "Vehicle RC Card" -> rcNo ?: empOrBadgeId ?: "UNPARSED-NO"
-            "Drug / Trade License" -> drugLic ?: empOrBadgeId ?: "UNPARSED-NO"
+            "Voter ID Card (EPIC)" -> epic ?: empOrCardId ?: "UNPARSED-NO"
+            "Aadhaar Card" -> maskedUid ?: "[ID Protected]"
+            "ABHA Card (Ayushman Bharat)" -> abha ?: empOrCardId ?: "UNPARSED-NO"
+            "Unique Disability ID (UDID)" -> udid ?: empOrCardId ?: "UNPARSED-NO"
+            "MGNREGA Job Card" -> mgnrega ?: empOrCardId ?: "UNPARSED-NO"
+            "Udyam Registration Certificate" -> udyam ?: empOrCardId ?: "UNPARSED-NO"
+            "GST Registration Certificate" -> gstin ?: empOrCardId ?: "UNPARSED-NO"
+            "Certificate of Incorporation (COI)" -> cin ?: empOrCardId ?: "UNPARSED-NO"
+            "Nadakacheri Income & Caste Certificate" -> nadaKacheriRd ?: empOrCardId ?: "UNPARSED-NO"
+            "Drug / Trade License" -> drugLic ?: empOrCardId ?: "UNPARSED-NO"
+            "Vehicle RC Card" -> rcNo ?: empOrCardId ?: "UNPARSED-NO"
             "Bank Passbook" -> extractBankAccountNo(upper, dynamicPairs) ?: ifsc ?: "UNPARSED-NO"
-            "Academic Marks Card" -> extractAcademicRegNo(upper, dynamicPairs) ?: "UNPARSED-NO"
-            "National ID Card" -> maskedUid ?: "[ID Redacted]"
-            "Employee / Institutional ID" -> empOrBadgeId ?: "UNPARSED-NO"
-            else -> pan ?: dl ?: rd ?: drugLic ?: epicNo ?: rcNo ?: empOrBadgeId ?: maskedUid ?: "UNPARSED-NO"
+            else -> nadaKacheriRd ?: pan ?: dl ?: gstin ?: udyam ?: cin ?: udid ?: abha ?: mgnrega ?: drugLic ?: epic ?: rcNo ?: empOrCardId ?: maskedUid ?: "UNPARSED-NO"
         }
 
-        // 5. High-Precision Multi-Strategy Holder Name Resolution (Labeled + Tagless + Cross-Referenced)
         val holderName = mrz?.first ?: resolveHolderNameDynamic(allLines, visibleLines, dynamicPairs, docNo)
-
-        // 6. Date Segregation (Issue/DOJ, Expiry/Validity, DOB)
         val (issueDate, expiryDate, dob) = extractDatesDynamic(allLines, dynamicPairs)
-
-        // 7. Build Rich JSON of All Remaining Dynamic Tags
         val phone = PHONE_REGEX.find(cleanText)?.groupValues?.get(1)
-        val extraJson = buildDynamicTagsJson(
-            upper = upper,
-            visibleLines = visibleLines,
-            dynamicPairs = dynamicPairs,
-            dob = dob,
-            ifsc = ifsc,
-            primaryDocNo = docNo,
-            holderName = holderName
-        )
+        val extraJson = buildDynamicTagsJson(upper, visibleLines, dynamicPairs, dob, ifsc, docNo, holderName)
 
         return ParsedDocumentPayload(
-            docCategory = cat,
+            docCategory = category,
             docSubType = subType,
-            issuingAuthority = auth,
+            issuingAuthority = authority,
             extractedName = holderName,
             documentNumber = docNo,
             issueDate = issueDate,
@@ -135,92 +136,164 @@ object DocumentParserEngine {
     }
 
     /**
-     * Harvests any `Key : Value` or `Key - Value` pairs across any document type automatically.
+     * Complete 40+ Document Classifier covering National IDs, Healthcare/Welfare,
+     * Transit/Service, Academic, Karnataka State IDs, National Certificates & Karnataka Certificates.
      */
-    private fun harvestDynamicKeyValuePairs(lines: List<String>): Map<String, String> {
-        val map = LinkedHashMap<String, String>()
-        val kvRegex = Regex("^([A-Za-z][A-Za-z0-9\\s./'()-]{1,28})\\s*[:;-]+\\s*(.+)$")
+    private fun classifyAllIndianAndKarnatakaDocs(
+        upper: String,
+        lines: List<String>,
+        pan: String?,
+        dl: String?,
+        ifsc: String?,
+        gstin: String?,
+        udyam: String?,
+        cin: String?,
+        udid: String?,
+        abha: String?,
+        mgnrega: String?,
+        rd: String?,
+        drugLic: String?,
+        mrz: Boolean,
+        epic: String?,
+        rc: String?,
+        uid: String?,
+        empId: String?
+    ): Triple<String, String, String> {
+        return when {
+            // 1. Karnataka State Certificates
+            upper.contains("NADAKACHERI") || upper.contains("NADA KACHERI") || upper.contains("ATALJI JANASNEHI") || rd != null ->
+                Triple("KARNATAKA_CERT", "Nadakacheri Income & Caste Certificate", "Revenue Dept., Karnataka (Nadakacheri)")
+            upper.contains("PAHANI") || upper.contains("BHOOMI") || (upper.contains("RTC") && upper.contains("SURVEY")) || upper.contains("TENANCY AND CROPS") ->
+                Triple("KARNATAKA_CERT", "RTC (Pahani) Extract", "Bhoomi Portal / Revenue Dept., Karnataka")
+            upper.contains("MUTATION") || upper.contains("MR NO") || upper.contains("HABBALI") ->
+                Triple("KARNATAKA_CERT", "Mutation Extract", "Revenue Dept., Karnataka")
+            upper.contains("LEGAL HEIR") || upper.contains("SUCCESSION CERTIFICATE") || upper.contains("SURVIVING FAMILY") || upper.contains("VARASAT") ->
+                Triple("KARNATAKA_CERT", "Legal Heir / Succession Certificate", "Tahsildar Office, Karnataka")
+            upper.contains("KANNADIGA") || upper.contains("MOTHER TONGUE") || upper.contains("KANNADA MEDIUM") ->
+                Triple("KARNATAKA_CERT", "Kannadiga / Mother Tongue Certificate", "State Educational / Revenue Bodies, Karnataka")
 
+            // 2. Karnataka State ID Cards
+            upper.contains("SENIOR CITIZEN") || upper.contains("SEVA SINDHU") ->
+                Triple("KARNATAKA_ID", "Karnataka Senior Citizen Card", "Dept. of Empowerment / Seva Sindhu")
+            upper.contains("RATION CARD") || upper.contains("FOOD AND CIVIL") || upper.contains("AHARA") || upper.contains("ANTYODAYA") ->
+                Triple("KARNATAKA_ID", "Smart Ration Card (Karnataka)", "Dept. of Food & Civil Supplies")
+            upper.contains("MATSYADHARA") || upper.contains("FISHERIES") || upper.contains("FISHERMEN") ->
+                Triple("KARNATAKA_ID", "Matsyadhara / Fishermen ID", "Dept. of Fisheries, Karnataka")
+            upper.contains("BUNKAR") || upper.contains("WEAVER") || upper.contains("HANDLOOMS") ->
+                Triple("KARNATAKA_ID", "Weaver ID Card (Bunkar Card)", "Dept. of Handlooms & Textiles")
+            upper.contains("KGID") || (upper.contains("GOVERNMENT OF KARNATAKA") && upper.contains("EMPLOYEE")) ->
+                Triple("KARNATAKA_ID", "Karnataka Govt. Employee ID", "State Government Departments, Karnataka")
+
+            // 3. National & General Certificates
+            upper.contains("UDYAM") || upper.contains("MSME") || udyam != null ->
+                Triple("NATIONAL_CERT", "Udyam Registration Certificate", "Ministry of MSME")
+            upper.contains("GOODS AND SERVICES TAX") || upper.contains("GSTIN") || gstin != null ->
+                Triple("NATIONAL_CERT", "GST Registration Certificate", "Goods and Services Tax Network")
+            upper.contains("CERTIFICATE OF INCORPORATION") || upper.contains("MINISTRY OF CORPORATE AFFAIRS") || cin != null ->
+                Triple("NATIONAL_CERT", "Certificate of Incorporation (COI)", "Ministry of Corporate Affairs")
+            upper.contains("DRUG") || upper.contains("DLNO") || drugLic != null ->
+                Triple("NATIONAL_CERT", "Drug / Trade License", detectOrgAuthority(lines))
+            upper.contains("BIRTH CERTIFICATE") || upper.contains("REGISTRATION OF BIRTHS") ->
+                Triple("NATIONAL_CERT", "Birth Certificate", "Municipal Corporations / Local Bodies")
+            upper.contains("DEATH CERTIFICATE") || upper.contains("REGISTRATION OF DEATHS") ->
+                Triple("NATIONAL_CERT", "Death Certificate", "Municipal Corporations / Local Bodies")
+            upper.contains("MARRIAGE CERTIFICATE") || upper.contains("REGISTRAR OF MARRIAGES") ->
+                Triple("NATIONAL_CERT", "Marriage Certificate", "Registrar of Marriages")
+            upper.contains("ECONOMICALLY WEAKER") || upper.contains("INCOME AND ASSET") || upper.contains("EWS") ->
+                Triple("NATIONAL_CERT", "Income & Asset Certificate (EWS)", "Revenue Authorities")
+            upper.contains("CASTE CERTIFICATE") || upper.contains("SCHEDULED CASTE") || upper.contains("SCHEDULED TRIBE") || upper.contains("OBC") ->
+                Triple("NATIONAL_CERT", "Caste Certificate", "Revenue Dept. / Competent Authority")
+            upper.contains("DOMICILE") || upper.contains("RESIDENCE CERTIFICATE") || upper.contains("RESIDENTIAL CERTIFICATE") ->
+                Triple("NATIONAL_CERT", "Domicile / Residence Certificate", "State Government Authorities")
+            upper.contains("POLICE CLEARANCE") || upper.contains("PCC") ->
+                Triple("NATIONAL_CERT", "Police Clearance Certificate (PCC)", "Police Dept. / Ministry of External Affairs")
+            upper.contains("DEGREE") || upper.contains("PROVISIONAL CERTIFICATE") || upper.contains("PASSING CERTIFICATE") || upper.contains("CONVOCATION") ->
+                Triple("NATIONAL_CERT", "Degree / Passing Certificate", "Educational Boards / Universities")
+
+            // 4. Healthcare & Social Welfare Cards
+            upper.contains("ABHA") || upper.contains("AYUSHMAN BHARAT") || upper.contains("PM-JAY") || abha != null ->
+                Triple("HEALTH_WELFARE", "ABHA Card (Ayushman Bharat)", "National Health Authority (NHA)")
+            upper.contains("CGHS") || upper.contains("ECHS") || upper.contains("CONTRIBUTORY HEALTH") ->
+                Triple("HEALTH_WELFARE", "CGHS / ECHS Card", "Central Govt. / Ministry of Defence")
+            upper.contains("E-SHRAM") || upper.contains("ESHRAM") || upper.contains("UNORGANISED WORKER") ->
+                Triple("HEALTH_WELFARE", "e-Shram Card", "Ministry of Labour & Employment")
+            upper.contains("EPFO") || upper.contains("PROVIDENT FUND") || upper.contains("UNIVERSAL ACCOUNT NUMBER") || upper.contains("UAN") ->
+                Triple("HEALTH_WELFARE", "UAN / EPFO Card", "Employees' Provident Fund Org.")
+            upper.contains("MGNREGA") || upper.contains("NREGA") || upper.contains("JOB CARD") || mgnrega != null ->
+                Triple("HEALTH_WELFARE", "MGNREGA Job Card", "Ministry of Rural Development")
+            upper.contains("UDID") || upper.contains("DISABILITY") || upper.contains("SWAVALAMBAN") || udid != null ->
+                Triple("HEALTH_WELFARE", "Unique Disability ID (UDID)", "Ministry of Social Justice")
+
+            // 5. Specialized, Transit & Service IDs
+            upper.contains("OVERSEAS CITIZEN OF INDIA") || upper.contains("OCI") ->
+                Triple("TRANSIT_SERVICE", "OCI Card", "Ministry of External Affairs")
+            upper.contains("CANTEEN STORES") || upper.contains("CSD") || upper.contains("ARMED FORCES") ->
+                Triple("TRANSIT_SERVICE", "Defense / CSD Smart Card", "Ministry of Defence")
+            upper.contains("INDIAN RAILWAYS") || upper.contains("SOUTH WESTERN RAILWAY") || upper.contains("RAILWAY IDENTITY") ->
+                Triple("TRANSIT_SERVICE", "Railway Identity Card", "Indian Railways")
+            upper.contains("POLICE") || upper.contains("CAPF") || upper.contains("CRPF") || upper.contains("BSF") || upper.contains("CISF") ->
+                Triple("TRANSIT_SERVICE", "Paramilitary / Police ID Card", "Central Armed Police / State Police")
+
+            // 6. School, College & Academic IDs
+            upper.contains("APAAR") || upper.contains("ACADEMIC BANK OF CREDITS") || upper.contains("ONE NATION ONE STUDENT") ->
+                Triple("ACADEMIC_ID", "APAAR ID", "Ministry of Education (Govt. of India)")
+            upper.contains("PERMANENT EDUCATION NUMBER") || upper.contains("UDISE") || upper.contains("PEN NO") ->
+                Triple("ACADEMIC_ID", "Permanent Education Number (PEN)", "UDISE+ / Ministry of Education")
+            upper.contains("MARKS") || upper.contains("SECONDARY EDUCATION") || upper.contains("KSEAB") || upper.contains("SSLC") || upper.contains("CBSE") || upper.contains("ICSE") || upper.contains("VTU") ->
+                Triple("ACADEMIC_ID", "Board/University Enrollment Card", "CBSE, ICSE, State Boards, Universities")
+            upper.contains("STUDENT") || upper.contains("USN") || upper.contains("CAMPUS") || upper.contains("COLLEGE") || upper.contains("INSTITUTE") ->
+                Triple("ACADEMIC_ID", "Institutional Student ID Card", detectOrgAuthority(lines))
+
+            // 7. National Identity & Financial IDs
+            upper.contains("INCOME TAX") || upper.contains("PERMANENT ACCOUNT") || pan != null ->
+                Triple("NATIONAL_ID", "PAN Card", "Income Tax Dept. (Govt. of India)")
+            upper.contains("DRIVING LICENCE") || upper.contains("DRIVING LICENSE") || dl != null ->
+                Triple("NATIONAL_ID", "Driving Licence (DL)", "State Transport Dept. / MoRTH")
+            mrz || (upper.contains("REPUBLIC OF INDIA") && upper.contains("PASSPORT")) ->
+                Triple("NATIONAL_ID", "Indian Passport", "Ministry of External Affairs")
+            upper.contains("ELECTION COMMISSION") || upper.contains("ELECTOR") || epic != null ->
+                Triple("NATIONAL_ID", "Voter ID Card (EPIC)", "Election Commission of India")
+            upper.contains("REGISTRATION CERTIFICATE") || upper.contains("CHASSIS") || rc != null ->
+                Triple("NATIONAL_ID", "Vehicle RC Card", "State Transport Dept. / RTO")
+            upper.contains("PASSBOOK") || upper.contains("IFSC") || ifsc != null ->
+                Triple("NATIONAL_ID", "Bank Passbook", detectBankAuthority(upper))
+            upper.contains("UNIQUE IDENTIFICATION") || upper.contains("UIDAI") || upper.contains("QR_UID_LAST4") || uid != null ->
+                Triple("NATIONAL_ID", "Aadhaar Card", "UIDAI (Govt. of India)")
+
+            // 8. Corporate / Institutional Employee ID Cards (Reliance, Jio, etc.)
+            upper.contains("EC NO") || upper.contains("EMP NO") || upper.contains("WHILE ON DUTY") ||
+                upper.contains("ID CARD CELL") || upper.contains("DOJ") || upper.contains("ID MARK") ||
+                upper.contains("BLOOD GROUP") || empId != null ->
+                Triple("TRANSIT_SERVICE", "Employee / Institutional ID Card", detectOrgAuthority(lines))
+
+            else ->
+                Triple("NATIONAL_CERT", "Government / Institutional Document", detectOrgAuthority(lines))
+        }
+    }
+
+    /**
+     * Splits multiple `Key: Value` pairs even when printed on the same horizontal line.
+     */
+    private fun harvestAllKeyValuePairs(lines: List<String>): Map<String, String> {
+        val map = LinkedHashMap<String, String>()
+        val inlineKvRegex = Regex(
+            "([A-Za-z][A-Za-z0-9\\s./'()-]{1,24}?)\\s*[:;-]+\\s*([^:]+?)(?=\\s{2,}[A-Za-z]|$)"
+        )
         for (line in lines) {
-            val segments = line.split("   ").map { it.trim() }.filter { it.isNotEmpty() }
-            for (seg in segments) {
-                val match = kvRegex.find(seg) ?: continue
-                val rawKey = match.groupValues[1].trim()
-                val rawVal = match.groupValues[2].trim()
-                if (rawKey.length in 2..28 && rawVal.isNotEmpty() && !rawKey.uppercase().startsWith("HTTP")) {
-                    map[rawKey] = rawVal
+            for (match in inlineKvRegex.findAll(line)) {
+                val k = match.groupValues[1].trim()
+                val v = match.groupValues[2].trim()
+                if (k.length in 2..24 && v.isNotEmpty() && !k.uppercase().startsWith("HTTP") && !k.uppercase().equals("WW")) {
+                    map[k] = v
                 }
             }
         }
         return map
     }
 
-    private fun classifyDocumentDynamic(
-        upper: String,
-        lines: List<String>,
-        hasPan: Boolean,
-        hasDl: Boolean,
-        hasIfsc: Boolean,
-        hasRd: Boolean,
-        hasMrz: Boolean,
-        hasEpic: Boolean,
-        hasRc: Boolean,
-        hasUid: Boolean,
-        hasDrugLic: Boolean,
-        hasEmpId: Boolean
-    ): Triple<String, String, String> {
-        return when {
-            upper.contains("INCOME TAX") || upper.contains("PERMANENT ACCOUNT") || hasPan ->
-                Triple("ID_CARD", "PAN Card", "Income Tax Department, Govt. of India")
-
-            upper.contains("DRIVING LICENCE") || upper.contains("DRIVING LICENSE") || hasDl ->
-                Triple("ID_CARD", "Driving License", "Regional Transport Office (RTO)")
-
-            hasMrz || (upper.contains("REPUBLIC OF INDIA") && upper.contains("PASSPORT")) ->
-                Triple("PASSPORT", "Indian Passport", "Ministry of External Affairs, Govt. of India")
-
-            upper.contains("NADA KACHERI") || upper.contains("TAHSILDAR") || hasRd ->
-                Triple("GOVT_CERT", "Nada Kacheri Certificate", "Revenue Department (Nada Kacheri)")
-
-            upper.contains("ELECTION COMMISSION") || upper.contains("ELECTOR") || hasEpic ->
-                Triple("ID_CARD", "Voter ID (EPIC)", "Election Commission of India")
-
-            upper.contains("REGISTRATION CERTIFICATE") || upper.contains("CHASSIS") || hasRc ->
-                Triple("ID_CARD", "Vehicle RC Card", "Transport Department (RTO)")
-
-            upper.contains("DRUG") || upper.contains("DLNO") || hasDrugLic ->
-                Triple("GOVT_CERT", "Drug / Trade License", detectOrganizationAuthority(lines))
-
-            upper.contains("PASSBOOK") || upper.contains("IFSC") || hasIfsc ->
-                Triple("BANK_PASSBOOK", "Bank Passbook", detectBankAuthority(upper))
-
-            upper.contains("MARKS") || upper.contains("UNIVERSITY") || upper.contains("SECONDARY EDUCATION") ||
-                upper.contains("KSEAB") || upper.contains("SSLC") ->
-                Triple("MARKS_CARD", "Academic Marks Card", detectOrganizationAuthority(lines))
-
-            upper.contains("AYUSHMAN") || upper.contains("ABHA") || upper.contains("PM-JAY") || upper.contains("HEALTH CARD") ->
-                Triple("MEDICAL", "Health / ABHA ID Card", "National Health Authority (NHA)")
-
-            upper.contains("RATION CARD") || upper.contains("FOOD AND CIVIL") ->
-                Triple("GOVT_CERT", "Ration Card", "Department of Food & Civil Supplies")
-
-            upper.contains("UNIQUE IDENTIFICATION") || upper.contains("UIDAI") ||
-                upper.contains("QR_UID_LAST4") || hasUid ->
-                Triple("ID_CARD", "National ID Card", "Unique Identification Authority of India")
-
-            upper.contains("EC NO") || upper.contains("EMP NO") || upper.contains("EMPLOYEE") ||
-                upper.contains("WHILE ON DUTY") || upper.contains("ID CARD CELL") ||
-                upper.contains("DOJ") || upper.contains("ID MARK") || upper.contains("BLOOD GROUP") || hasEmpId ->
-                Triple("ID_CARD", "Employee / Institutional ID", detectOrganizationAuthority(lines))
-
-            else ->
-                Triple("GOVT_CERT", "Government / Institutional Document", detectOrganizationAuthority(lines))
-        }
-    }
-
-    private fun detectOrganizationAuthority(lines: List<String>): String {
+    private fun detectOrgAuthority(lines: List<String>): String {
         val orgRegex = Regex(
-            "\\b(LTD|LIMITED|PVT|CORPORATE|CORP|RELIANCE|JIO|INSTITUTE|COLLEGE|UNIVERSITY|BOARD|HOSPITAL|TRUST|AUTHORITY|DEPARTMENT|MINISTRY|OFFICE)\\b",
+            "\\b(LTD|LIMITED|PVT|CORPORATE|CORP|RELIANCE|JIO|INSTITUTE|COLLEGE|UNIVERSITY|BOARD|HOSPITAL|TRUST|AUTHORITY|DEPARTMENT|MINISTRY|MUNICIPAL|TAHSILDAR)\\b",
             RegexOption.IGNORE_CASE
         )
         val matches = lines.filter {
@@ -229,113 +302,88 @@ object DocumentParserEngine {
                 !it.uppercase().contains("SIGNATURE") &&
                 !it.uppercase().contains("DISPLAYED BY") &&
                 it.length in 3..58
-        }.map { it.trim().trimEnd(',', '.') }
+        }.map { it.replace("|T", "IT").trim().trimEnd(',', '.') }
 
-        return if (matches.isNotEmpty()) {
-            matches.distinct().take(2).joinToString(" • ")
-        } else {
-            "Government / Institutional Authority"
-        }
+        return if (matches.isNotEmpty()) matches.distinct().take(2).joinToString(" • ")
+        else "Government / Institutional Authority"
     }
 
-    private fun findEmployeeOrInstitutionalId(
+    private fun findEmployeeOrCardId(
         upper: String,
         allLines: List<String>,
-        dynamicPairs: Map<String, String>
+        pairs: Map<String, String>
     ): String? {
-        // 1. Check explicit labeled keys in dynamic map (EC No, Emp No, Badge No, ID No, Card No)
-        val idKeyRegex = Regex("(?:^|\\b)(?:EC|EMP|EMPLOYEE|BADGE|STAFF|CARD|ID|PRAN|UAN|PPO)\\s*(?:NO|NUMBER|CODE|ID)?$", RegexOption.IGNORE_CASE)
-        for ((k, v) in dynamicPairs) {
-            if (idKeyRegex.containsMatchIn(k)) {
-                val token = Regex("([A-Z0-9/-]{5,15})").find(v.uppercase())?.value
-                if (token != null && token.any { it.isDigit() }) return token
+        val idKeyRegex = Regex(
+            "(?:^|\\b)(?:EC|EMP|EMPLOYEE|BADGE|STAFF|CARD|ID|PRAN|UAN|PPO|KGID|PEN|APAAR|USN|ROLL|REG|CERT|CERTIFICATE|SURVEY|MR)\\s*(?:NO|NUMBER|CODE|ID)?$",
+            RegexOption.IGNORE_CASE
+        )
+        for ((k, v) in pairs) {
+            if (idKeyRegex.containsMatchIn(k.trim())) {
+                val tok = Regex("([A-Z0-9/-]{5,18})").find(v.uppercase())?.value
+                if (tok != null && tok.any { it.isDigit() }) return tok
             }
         }
 
-        // 2. Regex scan for EC No / Emp No
-        Regex("(?:EC\\s*NO|EMP(?:LOYEE)?\\s*(?:NO|ID|CODE)|BADGE\\s*NO|ID\\s*NO|CARD\\s*NO)[\\s.:;-]*([A-Z0-9-]{5,15})")
+        Regex("(?:EC\\s*NO|EMP(?:LOYEE)?\\s*(?:NO|ID|CODE)|BADGE\\s*NO|KGID|UAN|APAAR|PEN\\s*NO|CERT(?:IFICATE)?\\s*NO|REG(?:ISTER|ISTRATION)?\\s*NO)[\\s.:;-]*([A-Z0-9/-]{5,18})")
             .find(upper)?.let { return it.groupValues[1].trim() }
 
-        // 3. Check Spatial ID Candidate from badge layout
         allLines.firstOrNull { it.startsWith("SPATIAL_ID_CANDIDATE :") }?.let {
             return it.substringAfter(":").trim()
         }
 
-        // 4. Find any 6-to-10 digit number that appears on both Front and Back (or standalone on badge)
-        val standaloneNumbers = allLines
+        val standalone = allLines
             .filter { !it.startsWith("SPATIAL_") }
             .map { it.trim() }
-            .filter { Regex("^[0-9]{6,10}$").matches(it) && !it.startsWith("1800") && it.length != 6 }
-        if (standaloneNumbers.isNotEmpty()) {
-            return standaloneNumbers.first()
-        }
-        return null
+            .filter { Regex("^[0-9]{7,10}$").matches(it) && !it.startsWith("1800") }
+        return standalone.lastOrNull()
     }
 
-    /**
-     * Multi-Strategy Dynamic Holder Name Resolver:
-     * Accurately resolves names whether labeled ("Name: ...") OR completely tagless
-     * (like "Inayatulla\nChajjo" above "55064480" on a corporate/govt badge).
-     */
     private fun resolveHolderNameDynamic(
         allLines: List<String>,
         visibleLines: List<String>,
-        dynamicPairs: Map<String, String>,
+        pairs: Map<String, String>,
         docNo: String
     ): String {
-        // Priority 1: QR Verified Name
         allLines.firstOrNull { it.startsWith("QR_NAME :") }?.let {
             val c = cleanNameString(it.substringAfter(":"))
             if (isValidHumanName(c)) return titleCase(c)
         }
 
-        // Priority 2: Explicit Name Key in Dynamic Key-Value Map
-        val nameKeyRegex = Regex("^(?!.*(?:FATHER|MOTHER|SPOUSE|HUSBAND|WIFE|GUARDIAN|BANK|COMPANY|ORG|ISSUING|AUTHORITY))(?:NAME|FULL\\s*NAME|HOLDER(?:\\s*NAME)?|EMPLOYEE(?:\\s*NAME)?|CANDIDATE(?:\\s*NAME)?|STUDENT(?:\\s*NAME)?|APPLICANT(?:\\s*NAME)?|ELECTOR'?S?\\s*NAME)$", RegexOption.IGNORE_CASE)
-        for ((k, v) in dynamicPairs) {
+        val nameKeyRegex = Regex(
+            "^(?!.*(?:FATHER|MOTHER|SPOUSE|HUSBAND|WIFE|GUARDIAN|BANK|COMPANY|ORG|ISSUING|AUTHORITY|VILLAGE|TALUK))(?:NAME|FULL\\s*NAME|HOLDER(?:\\s*NAME)?|EMPLOYEE(?:\\s*NAME)?|CANDIDATE(?:\\s*NAME)?|STUDENT(?:\\s*NAME)?|APPLICANT(?:\\s*NAME)?|BENEFICIARY(?:\\s*NAME)?|ELECTOR'?S?\\s*NAME)$",
+            RegexOption.IGNORE_CASE
+        )
+        for ((k, v) in pairs) {
             if (nameKeyRegex.matches(k.trim())) {
                 val c = cleanNameString(v)
                 if (isValidHumanName(c)) return titleCase(c)
             }
         }
 
-        // Priority 3: Spatial Badge Name (Stacked directly above standalone ID number in bounding-box space)
         allLines.firstOrNull { it.startsWith("SPATIAL_BADGE_NAME :") }?.let {
             val c = cleanNameString(it.substringAfter(":"))
             if (isValidHumanName(c)) return titleCase(c)
         }
 
-        // Priority 4: Cross-Referenced ID Anchor (Finds lines immediately above/below `docNo` in the text stream)
-        if (docNo != "UNPARSED-NO") {
-            for (i in visibleLines.indices) {
-                val line = visibleLines[i].trim()
-                // Match standalone ID line (not the "EC No: 55064480" line, or even if standalone)
-                if (line == docNo || (line.contains(docNo) && !line.contains(":"))) {
-                    val stackAbove = collectAdjacentNameLinesAbove(visibleLines, i)
-                    if (stackAbove.isNotEmpty()) {
-                        return titleCase(stackAbove)
-                    }
-                }
+        // Cross-Referenced Tagless Name Directly Above Standalone ID / EC Number (e.g., Inayatulla + Chajjo above 55064480)
+        for (i in visibleLines.indices) {
+            val cur = visibleLines[i].trim()
+            if ((docNo != "UNPARSED-NO" && cur == docNo) || Regex("^[0-9]{7,10}$").matches(cur)) {
+                val stack = collectAdjacentNameLinesAbove(visibleLines, i)
+                if (stack.isNotEmpty()) return titleCase(stack)
             }
         }
 
-        // Priority 5: Spatial Prominent Font-Size Name Candidate
-        allLines.firstOrNull { it.startsWith("SPATIAL_PROMINENT_NAME :") }?.let {
-            val c = cleanNameString(it.substringAfter(":"))
-            if (isValidHumanName(c)) return titleCase(c)
-        }
-
-        // Priority 6: Line immediately above "Father's Name", "DOB", or "Date of Birth"
         for (i in visibleLines.indices) {
             val u = visibleLines[i].uppercase()
             if ((u.contains("FATHER") || u.startsWith("S/O") || u.startsWith("D/O") || u.startsWith("W/O") ||
                     u.contains("DOB") || u.contains("DATE OF BIRTH")) && i >= 1
             ) {
-                val stackAbove = collectAdjacentNameLinesAbove(visibleLines, i)
-                if (stackAbove.isNotEmpty()) return titleCase(stackAbove)
+                val stack = collectAdjacentNameLinesAbove(visibleLines, i)
+                if (stack.isNotEmpty()) return titleCase(stack)
             }
         }
 
-        // Priority 7: Highest-Scoring Tagless Human Name Cluster across the entire document
         var bestCandidate = ""
         var bestScore = 0
         var idx = 0
@@ -348,8 +396,9 @@ object DocumentParserEngine {
                     next++
                 }
                 val combined = cleanNameString(cluster.joinToString(" "))
-                val score = scoreHumanNameCandidate(combined, cluster.size)
-                if (score > bestScore) {
+                val words = combined.split("\\s+".toRegex()).filter { it.isNotEmpty() }
+                val score = if (isValidHumanName(combined)) (words.size * 15 + cluster.size * 10) else 0
+                if (score >= bestScore && score >= 25) {
                     bestScore = score
                     bestCandidate = combined
                 }
@@ -359,20 +408,16 @@ object DocumentParserEngine {
             }
         }
 
-        return if (bestScore >= 25 && bestCandidate.isNotBlank()) {
-            titleCase(bestCandidate)
-        } else {
-            "Unknown Member"
-        }
+        return if (bestCandidate.isNotBlank()) titleCase(bestCandidate) else "Unknown Member"
     }
 
     private fun collectAdjacentNameLinesAbove(lines: List<String>, anchorIndex: Int): String {
         val parts = mutableListOf<String>()
         var b = anchorIndex - 1
         while (b >= 0 && parts.size < 3) {
-            val candidateLine = lines[b].trim()
-            if (isTaglessNameTokenLine(candidateLine)) {
-                parts.add(0, candidateLine)
+            val line = lines[b].trim()
+            if (isTaglessNameTokenLine(line)) {
+                parts.add(0, line)
                 b--
             } else {
                 break
@@ -382,22 +427,11 @@ object DocumentParserEngine {
         return if (isValidHumanName(combined)) combined else ""
     }
 
-    private fun scoreHumanNameCandidate(candidate: String, lineCount: Int): Int {
-        if (!isValidHumanName(candidate)) return 0
-        val words = candidate.split("\\s+".toRegex()).filter { it.isNotEmpty() }
-        var score = 20
-        if (words.size in 2..3) score += 25
-        if (lineCount >= 2) score += 15
-        if (words.all { it.length >= 4 }) score += 10
-        return score
-    }
-
     private fun isTaglessNameTokenLine(line: String): Boolean {
         val t = line.trim()
         if (t.length !in 3..32 || t.contains(":") || !Regex("^[A-Za-z.\\s]+$").matches(t)) return false
         val words = t.uppercase().replace(".", "").split("\\s+".toRegex()).filter { it.isNotEmpty() }
-        if (words.isEmpty() || words.size > 4) return false
-        if (words.any { it in NON_NAME_DICTIONARY || it.length < 2 }) return false
+        if (words.isEmpty() || words.size > 4 || words.any { it in NON_NAME_DICTIONARY || it.length < 2 }) return false
         val vowels = setOf('A', 'E', 'I', 'O', 'U', 'Y')
         return words.none { w -> w.length >= 3 && w.none { c -> c in vowels } }
     }
@@ -423,15 +457,14 @@ object DocumentParserEngine {
 
     private fun extractDatesDynamic(
         allLines: List<String>,
-        dynamicPairs: Map<String, String>
+        pairs: Map<String, String>
     ): Triple<String?, String?, String?> {
         var issue: String? = null
         var expiry: String? = null
         var dob: String? = null
-
         val dateRegex = Regex("\\b([0-3][0-9O])[/.\\s-]([0-1][0-9O])[/.\\s-](19[0-9]{2}|20[0-9]{2})\\b")
 
-        for ((k, v) in dynamicPairs) {
+        for ((k, v) in pairs) {
             val ku = k.uppercase()
             val m = dateRegex.find(v) ?: continue
             val iso = "${m.groupValues[3]}-${m.groupValues[2].replace('O', '0')}-${m.groupValues[1].replace('O', '0')}"
@@ -461,14 +494,10 @@ object DocumentParserEngine {
         return Triple(issue, expiry, dob)
     }
 
-    /**
-     * Dynamically packages all extracted tags on the card (Blood Group, Height, ID Mark, DOJ,
-     * Relation, Score, IFSC, Emergency Contact, Card Serial, Pincode, plus any custom `Key: Value` pairs).
-     */
     private fun buildDynamicTagsJson(
         upper: String,
         visibleLines: List<String>,
-        dynamicPairs: Map<String, String>,
+        pairs: Map<String, String>,
         dob: String?,
         ifsc: String?,
         primaryDocNo: String,
@@ -487,9 +516,8 @@ object DocumentParserEngine {
         Regex("(?:DOJ|DATE\\s*OF\\s*JOINING)\\s*[:.-]*\\s*([0-9]{2}[/-][0-9]{2}[/-][0-9]{4})", RegexOption.IGNORE_CASE)
             .find(upper)?.let { json.put("DOJ", it.groupValues[1].trim()) }
 
-        // Add all dynamically harvested Key-Value pairs from the card
-        val ignoredKeys = setOf("NAME", "EC NO", "EMP NO", "DOJ", "HEIGHT", "BLOOD GROUP", "IFSC")
-        for ((k, v) in dynamicPairs) {
+        val ignoredKeys = setOf("NAME", "EC NO", "EMP NO", "DOJ", "HEIGHT", "BLOOD GROUP", "IFSC", "WW")
+        for ((k, v) in pairs) {
             val ku = k.uppercase().trim()
             if (ku !in ignoredKeys && v != primaryDocNo && !v.equals(holderName, ignoreCase = true) && v.length <= 45) {
                 json.put(k, v)
@@ -497,11 +525,9 @@ object DocumentParserEngine {
         }
 
         PHONE_REGEX.find(upper)?.let { json.put("Emergency/Phone", it.groupValues[1]) }
-
         visibleLines.map { it.trim() }
-            .firstOrNull { Regex("^[0-9]{5,7}$").matches(it) && it != primaryDocNo }
+            .firstOrNull { Regex("^[0-9]{5,6}$").matches(it) && it != primaryDocNo }
             ?.let { json.put("Card Serial", it) }
-
         PINCODE_REGEX.find(upper)?.value?.let { json.put("Pincode", it) }
         return json.toString()
     }
@@ -548,13 +574,11 @@ object DocumentParserEngine {
         return if (m.groupValues[1] in STATE_CODES) "${m.groupValues[1]}${m.groupValues[2]}${m.groupValues[3]}${m.groupValues[4]}" else null
     }
 
-    private fun findMaskedUid(upper: String): String? {
-        Regex("QR_UID_LAST4\\s*:\\s*([0-9]{4})").find(upper)?.let {
-            return "XXXX-XXXX-${it.groupValues[1]}"
-        }
-        val m = Regex("\\b([2-9][0-9]{3})[\\s-]?([0-9]{4})[\\s-]?([0-9]{4})\\b").find(upper) ?: return null
+    private fun findMaskedNationalId(upper: String): String? {
+        if (upper.contains("QR_UID_LAST4")) return "[National ID Verified]"
+        val m = Regex("\\b([2-9][0-9]{3})[\\s-]([0-9]{4})[\\s-]([0-9]{4})\\b").find(upper) ?: return null
         val full = m.groupValues[1] + m.groupValues[2] + m.groupValues[3]
-        return if (validateVerhoeffChecksum(full)) "XXXX-XXXX-${m.groupValues[3]}" else null
+        return if (validateVerhoeffChecksum(full)) "[National ID Verified]" else null
     }
 
     private fun extractBankAccountNo(upper: String, pairs: Map<String, String>): String? {
@@ -563,13 +587,6 @@ object DocumentParserEngine {
             if (d != null) return d
         }
         return Regex("(?:A/C\\s*NO|ACCOUNT\\s*NO)[\\s.:-]*([0-9]{9,18})").find(upper)?.groupValues?.get(1)
-    }
-
-    private fun extractAcademicRegNo(upper: String, pairs: Map<String, String>): String? {
-        pairs.entries.firstOrNull { it.key.uppercase().contains("REG") || it.key.uppercase().contains("ROLL") }?.let {
-            return it.value.trim()
-        }
-        return Regex("(?:REG\\.?\\s*NO|REGISTER\\s*NO|ROLL\\s*NO)[\\s.:-]*([A-Z0-9]{5,15})").find(upper)?.groupValues?.get(1)
     }
 
     private fun parseMrzIfPresent(lines: List<String>): Pair<String, String>? {
