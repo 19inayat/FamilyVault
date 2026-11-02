@@ -1,4 +1,4 @@
-name: Sprint 3.3 - 40+ Indian & Karnataka ID Precision OCR Build
+name: Sprint 3.4 - ICU Regex Fix & Permanent Keystore Build
 
 on:
   push:
@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-apk:
@@ -15,13 +18,7 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Cache Persistent Debug Keystore
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: familyvault-persistent-debug-keystore-v1
-
-      - name: 3. Organize Package Paths & Verify Source Files
+      - name: 2. Organize Package Paths & Verify Source Files
         run: |
           python3 - << 'EOF'
           import os
@@ -65,32 +62,32 @@ jobs:
                   exit(1)
           EOF
 
-      - name: 4. Enforce Gradle & Manifest Configuration
-        run: |
-          cat << 'EOF' > app/src/main/AndroidManifest.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
-              <application
-                  android:allowBackup="false"
-                  android:icon="@android:drawable/ic_lock_lock"
-                  android:label="FamilyVault"
-                  android:supportsRtl="true"
-                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
-                      android:windowSoftInputMode="adjustResize">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
-          EOF
+      - name: 3. Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
 
+      - name: 4. Create & Commit Permanent Repo Keystore (Fixes Update Conflicts Forever)
+        run: |
+          if [ ! -f "app/familyvault-signing.jks" ]; then
+            keytool -genkeypair -v \
+              -keystore app/familyvault-signing.jks \
+              -storetype PKCS12 \
+              -storepass familyvault123 \
+              -alias familyvaultkey \
+              -keypass familyvault123 \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=FamilyVault,O=Industrial,C=IN"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add app/familyvault-signing.jks
+            git commit -m "chore: lock permanent APK signing keystore [skip ci]"
+            git push || true
+          fi
+
+      - name: 5. Enforce Gradle Configuration with Explicit Keystore Binding
+        run: |
           cat << 'EOF' > app/build.gradle.kts
           plugins {
               id("com.android.application")
@@ -105,8 +102,21 @@ jobs:
                   applicationId = "com.familyvault.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 12
-                  versionName = "0.3.3-40plus-docs"
+                  versionCode = 20
+                  versionName = "0.3.4-icu-fixed"
+              }
+              signingConfigs {
+                  getByName("debug") {
+                      storeFile = file("familyvault-signing.jks")
+                      storePassword = "familyvault123"
+                      keyAlias = "familyvaultkey"
+                      keyPassword = "familyvault123"
+                  }
+              }
+              buildTypes {
+                  getByName("debug") {
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -146,33 +156,19 @@ jobs:
           }
           EOF
 
-      - name: 5. Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: 6. Prepare Signing Key & SDK Licenses
-        run: |
-          mkdir -p ~/.android
-          if [ ! -f ~/.android/debug.keystore ]; then
-            keytool -genkeypair -v -keystore ~/.android/debug.keystore \
-              -storepass android -alias androiddebugkey -keypass android \
-              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-          fi
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
-
-      - name: 7. Install Gradle 8.10.2
+      - name: 6. Accept Android SDK Licenses & Install Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: 8. Compile Debug APK
-        run: gradle assembleDebug --no-daemon --console=plain
+      - name: 7. Compile Debug APK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          gradle assembleDebug --no-daemon --console=plain
 
-      - name: 9. Upload Compiled APK Artifact
+      - name: 8. Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FamilyVault-Sprint3.3-40PlusDocsOCR
+          name: FamilyVault-Sprint3.4-Fixed
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
