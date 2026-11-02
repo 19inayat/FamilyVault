@@ -136,14 +136,14 @@ private fun DynamicOcrWorkbench(activity: Activity, db: VaultDatabase, onLock: (
 
     var editableName by remember { mutableStateOf("") }
     var editableSubType by remember { mutableStateOf("") }
-    var editableCategory by remember { mutableStateOf("ID_CARD") }
+    var editableCategory by remember { mutableStateOf("NATIONAL_ID") }
     var editableNumber by remember { mutableStateOf("") }
     var editableAuthority by remember { mutableStateOf("") }
     var editableIssue by remember { mutableStateOf("") }
     var editableExpiry by remember { mutableStateOf("") }
     var editableTags by remember { mutableStateOf("{}") }
     var rawText by remember { mutableStateOf("") }
-    var banner by remember { mutableStateOf("Tap 'Scan Any Personal / Govt ID' to auto-detect all fields.") }
+    var banner by remember { mutableStateOf("Tap 'Scan Any National / Karnataka ID or Certificate' below.") }
     var pendingAttachments by remember { mutableStateOf<List<EncryptedPageAttachment>>(emptyList()) }
     var mismatchState by remember { mutableStateOf<Pair<NameResolutionResult.MinimalMismatchAlert, ParsedDocumentPayload>?>(null) }
 
@@ -151,7 +151,7 @@ private fun DynamicOcrWorkbench(activity: Activity, db: VaultDatabase, onLock: (
         if (res.resultCode == Activity.RESULT_OK) {
             val uris = GmsDocumentScanningResult.fromActivityResultIntent(res.data)?.pages?.map { it.imageUri }.orEmpty()
             if (uris.isNotEmpty()) {
-                banner = "Analyzing ${uris.size} page(s) with Spatial & Dynamic Tag Engine..."
+                banner = "Analyzing ${uris.size} page(s) across 40+ National & Karnataka ID schemas..."
                 scope.launch {
                     try {
                         val out = ScanAndVoiceProcessor.processScannedDocumentPages(activity, uris, crypto)
@@ -166,7 +166,7 @@ private fun DynamicOcrWorkbench(activity: Activity, db: VaultDatabase, onLock: (
                         editableTags = p.extraAttributesJson
                         rawText = p.rawText
                         pendingAttachments = out.attachments
-                        banner = "Auto-Detected: ${p.docSubType} • Holder: '${p.extractedName}' • ID: ${p.documentNumber}"
+                        banner = "Detected: ${p.docSubType} • Holder: '${p.extractedName}' • No: ${p.documentNumber}"
                     } catch (t: Throwable) {
                         banner = "Scan Error: ${t.localizedMessage}"
                     }
@@ -178,7 +178,7 @@ private fun DynamicOcrWorkbench(activity: Activity, db: VaultDatabase, onLock: (
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("FamilyVault • Dynamic ID Engine") },
+                title = { Text("FamilyVault • 40+ ID & Cert Engine") },
                 actions = { TextButton(onClick = onLock) { Text("Lock Vault") } }
             )
         }
@@ -197,23 +197,23 @@ private fun DynamicOcrWorkbench(activity: Activity, db: VaultDatabase, onLock: (
                             .addOnSuccessListener { scannerLauncher.launch(IntentSenderRequest.Builder(it).build()) }
                     },
                     modifier = Modifier.fillMaxWidth()
-                ) { Text("Scan Any Personal / Govt ID (Front & Back)", fontWeight = FontWeight.Bold) }
+                ) { Text("Scan Any National / Karnataka ID or Certificate", fontWeight = FontWeight.Bold) }
             }
             item { Text(banner, color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodySmall) }
             item {
                 OutlinedCard(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(editableName, { editableName = it }, label = { Text("Holder Name (Auto-Detected)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                        OutlinedTextField(editableName, { editableName = it }, label = { Text("Detected Holder Name") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedTextField(editableSubType, { editableSubType = it }, label = { Text("Document Type") }, modifier = Modifier.weight(1f), singleLine = true)
-                            OutlinedTextField(editableNumber, { editableNumber = it }, label = { Text("Document / EC / ID No") }, modifier = Modifier.weight(1f), singleLine = true)
+                            OutlinedTextField(editableSubType, { editableSubType = it }, label = { Text("ID / Certificate Type") }, modifier = Modifier.weight(1f), singleLine = true)
+                            OutlinedTextField(editableNumber, { editableNumber = it }, label = { Text("Document / EC / RD No") }, modifier = Modifier.weight(1f), singleLine = true)
                         }
-                        OutlinedTextField(editableAuthority, { editableAuthority = it }, label = { Text("Issuing Authority / Organization") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                        OutlinedTextField(editableAuthority, { editableAuthority = it }, label = { Text("Issuing Authority / Portal") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedTextField(editableIssue, { editableIssue = it }, label = { Text("Issue / DOJ Date") }, modifier = Modifier.weight(1f), singleLine = true)
                             OutlinedTextField(editableExpiry, { editableExpiry = it }, label = { Text("Expiry Date") }, modifier = Modifier.weight(1f), singleLine = true)
                         }
-                        OutlinedTextField(editableTags, { editableTags = it }, label = { Text("Dynamic Tags (Blood Group, Height, ID Mark, IFSC, etc.)") }, modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(editableTags, { editableTags = it }, label = { Text("Extracted Tags (Blood Group, Height, ID Mark, IFSC, etc.)") }, modifier = Modifier.fillMaxWidth())
                     }
                 }
             }
