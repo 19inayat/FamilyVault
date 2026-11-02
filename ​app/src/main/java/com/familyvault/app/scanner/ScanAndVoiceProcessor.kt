@@ -41,6 +41,8 @@ data class ScanExecutionResult(
     val parsedPayload: ParsedDocumentPayload,
     val qualityReport: String,
     val attachments: List<EncryptedPageAttachment>,
+    val encryptedFilePath: String,
+    val sha256Hash: String,
     val qrVerified: Boolean
 )
 
@@ -51,8 +53,15 @@ object ScanAndVoiceProcessor {
         val box: Rect,
         val centerY: Int,
         val centerX: Int,
-        val height: Int
+        val height: Int,
+        val width: Int
     )
+
+    suspend fun processScannedDocumentUri(
+        context: Context,
+        imageUri: Uri,
+        cryptoManager: VaultCryptoManager
+    ): ScanExecutionResult = processScannedDocumentPages(context, listOf(imageUri), cryptoManager)
 
     suspend fun processScannedDocumentPages(
         context: Context,
@@ -63,25 +72,22 @@ object ScanAndVoiceProcessor {
         val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         val barcodeScanner = BarcodeScanning.getClient()
 
-        val combinedTextBuilder = StringBuilder()
-        val qrLines = mutableListOf<String>()
-        val spatialNameHints = mutableListOf<String>()
-        val qualityReports = mutableListOf<String>()
+        val combinedText = StringBuilder()
+        val qrHints = mutableListOf<String>()
+        val spatialHints = mutableListOf<String>()
         val encryptedAttachments = mutableListOf<EncryptedPageAttachment>()
-
         val vaultDir = File(appContext.filesDir, "vault_encrypted_scans").apply { mkdirs() }
 
-        for ((index, uri) in imageUris.withIndex()) {
-            val rawBitmap = appContext.contentResolver.openInputStream(uri)?.use {
+        for ((idx, uri) in imageUris.withIndex()) {
+            val rawBmp = appContext.contentResolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it)
             } ?: continue
 
-            val normalizedBitmap = scaleToOptimalOcrResolution(rawBitmap)
-            val contrastBitmap = createHighContrastDocumentBitmap(normalizedBitmap)
-            qualityReports.add("P${index + 1}: ${evaluateBlurAndGlare(normalizedBitmap)}")
+            val normBmp = scaleBitmap(rawBmp)
+            val contrastBmp = enhanceContrast(normBmp)
 
-            val primaryImage = InputImage.fromBitmap(normalizedBitmap, 0)
-            val enhancedImage = InputImage.fromBitmap(contrastBitmap, 0)
+            val primaryImage = InputImage.fromBitmap(normBmp, 0)
+            val enhancedImage = InputImage.fromBitmap(contrastBmp, 0)
 
             val primaryOcr = textRecognizer.process(primaryImage).awaitTask()
             val enhancedOcr = textRecognizer.process(enhancedImage).awaitTask()
@@ -91,262 +97,226 @@ object ScanAndVoiceProcessor {
             } catch (_: Throwable) {
                 emptyList()
             }
+            barcodes.mapNotNull { it.rawValue }.forEach { qrHints.add(decodeQrPayload(it)) }
 
-            barcodes.mapNotNull { it.rawValue }.forEach { rawQr ->
-                qrLines.add(decodeGovernmentQrPayload(rawQr))
+            val (pText, pHints) = analyzeSpatialGeometry(primaryOcr)
+            val (eText, eHints) = analyzeSpatialGeometry(enhancedOcr)
+            spatialHints.addAll(pHints)
+            spatialHints.addAll(eHints)
+
+            combinedText.appendLine(pText)
+            if (eText.isNotBlank()) {
+                combinedText.appendLine("---ENHANCED_PASS---")
+                combinedText.appendLine(eText)
             }
 
-            val (primarySpatialText, detectedBadgeName) = reconstructSpatialDocumentLines(primaryOcr)
-            val (enhancedSpatialText, detectedEnhancedName) = reconstructSpatialDocumentLines(enhancedOcr)
-
-            if (detectedBadgeName != null) spatialNameHints.add(detectedBadgeName)
-            if (detectedEnhancedName != null) spatialNameHints.add(detectedEnhancedName)
-
-            combinedTextBuilder.appendLine(primarySpatialText)
-            if (enhancedSpatialText.isNotBlank()) {
-                combinedTextBuilder.appendLine("---ENHANCED_PASS---")
-                combinedTextBuilder.appendLine(enhancedSpatialText)
-            }
-
-            val webpStream = ByteArrayOutputStream()
-            val compressFormat = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val out = ByteArrayOutputStream()
+            val fmt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 Bitmap.CompressFormat.WEBP_LOSSY
             } else {
                 @Suppress("DEPRECATION")
                 Bitmap.CompressFormat.WEBP
             }
-            normalizedBitmap.compress(compressFormat, 90, webpStream)
-            val webpBytes = webpStream.toByteArray()
-
-            val destFile = File(vaultDir, "scan_${System.currentTimeMillis()}_p${index + 1}.enc")
-            val sha256 = cryptoManager.encryptStreamToVaultFile(
-                inputStream = ByteArrayInputStream(webpBytes),
-                destinationFile = destFile,
-                associatedData = "VaultScan_v2"
+            normBmp.compress(fmt, 90, out)
+            val destFile = File(vaultDir, "scan_${System.currentTimeMillis()}_p${idx + 1}.enc")
+            val sha = cryptoManager.encryptStreamToVaultFile(
+                ByteArrayInputStream(out.toByteArray()),
+                destFile,
+                "VaultScan_v2"
             )
-
-            encryptedAttachments.add(
-                EncryptedPageAttachment(
-                    pageOrder = index + 1,
-                    encryptedFilePath = destFile.absolutePath,
-                    sha256Hash = sha256
-                )
-            )
+            encryptedAttachments.add(EncryptedPageAttachment(idx + 1, destFile.absolutePath, sha))
         }
 
-        val fullMergedText = buildString {
-            if (qrLines.isNotEmpty()) {
-                appendLine(qrLines.joinToString("\n"))
-            }
-            spatialNameHints.distinct().forEach { hint ->
-                appendLine("SPATIAL_BADGE_NAME : $hint")
-            }
-            append(combinedTextBuilder.toString())
+        val fullMergedInput = buildString {
+            if (qrHints.isNotEmpty()) appendLine(qrHints.distinct().joinToString("\n"))
+            if (spatialHints.isNotEmpty()) appendLine(spatialHints.distinct().joinToString("\n"))
+            append(combinedText.toString())
         }.trim()
 
         val parsed = DocumentParserEngine.parseDocumentText(
-            fullMergedText.ifEmpty { "General Document\nName : Unknown Member" }
+            fullMergedInput.ifEmpty { "General Document\nName : Unknown Member" }
         )
+        val firstAtt = encryptedAttachments.firstOrNull()
 
         ScanExecutionResult(
             parsedPayload = parsed,
-            qualityReport = qualityReports.joinToString(" | "),
+            qualityReport = "${encryptedAttachments.size} Page(s) • Spatial+DualPass",
             attachments = encryptedAttachments,
-            qrVerified = qrLines.isNotEmpty()
+            encryptedFilePath = firstAtt?.encryptedFilePath.orEmpty(),
+            sha256Hash = firstAtt?.sha256Hash.orEmpty(),
+            qrVerified = qrHints.isNotEmpty()
         )
     }
 
-    private fun scaleToOptimalOcrResolution(source: Bitmap): Bitmap {
-        val maxDim = max(source.width, source.height)
-        if (maxDim in 1400..2400) return source
-        val scale = 2000f / maxDim.coerceAtLeast(1)
-        val targetW = (source.width * scale).toInt().coerceAtLeast(1)
-        val targetH = (source.height * scale).toInt().coerceAtLeast(1)
-        return Bitmap.createScaledBitmap(source, targetW, targetH, true)
+    private fun scaleBitmap(src: Bitmap): Bitmap {
+        val maxD = max(src.width, src.height)
+        if (maxD in 1500..2400) return src
+        val s = 2100f / maxD.coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(
+            src,
+            (src.width * s).toInt().coerceAtLeast(1),
+            (src.height * s).toInt().coerceAtLeast(1),
+            true
+        )
     }
 
-    private fun createHighContrastDocumentBitmap(source: Bitmap): Bitmap {
-        val bmp = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val contrast = 1.45f
-        val translate = -30f
-        val matrix = ColorMatrix(
+    private fun enhanceContrast(src: Bitmap): Bitmap {
+        val bmp = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        val c = 1.50f
+        val t = -35f
+        val cm = ColorMatrix(
             floatArrayOf(
-                0.299f * contrast, 0.587f * contrast, 0.114f * contrast, 0f, translate,
-                0.299f * contrast, 0.587f * contrast, 0.114f * contrast, 0f, translate,
-                0.299f * contrast, 0.587f * contrast, 0.114f * contrast, 0f, translate,
+                0.299f * c, 0.587f * c, 0.114f * c, 0f, t,
+                0.299f * c, 0.587f * c, 0.114f * c, 0f, t,
+                0.299f * c, 0.587f * c, 0.114f * c, 0f, t,
                 0f, 0f, 0f, 1f, 0f
             )
         )
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
-            colorFilter = ColorMatrixColorFilter(matrix)
-        }
-        canvas.drawBitmap(source, 0f, 0f, paint)
+        Canvas(bmp).drawBitmap(src, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(cm)
+        })
         return bmp
     }
 
     /**
-     * Reconstructs spatial rows and detects tagless stacked names placed directly above an ID number
-     * or printed in large badge typography on ID cards.
+     * Reconstructs visual table rows, pairs vertical label-value blocks, and identifies
+     * tagless prominent name stacks (by font height & proximity to standalone ID numbers).
      */
-    private fun reconstructSpatialDocumentLines(visionText: Text): Pair<String, String?> {
+    private fun analyzeSpatialGeometry(visionText: Text): Pair<String, List<String>> {
         val rawLines = mutableListOf<SpatialLine>()
+        val hints = mutableListOf<String>()
 
         for (block in visionText.textBlocks) {
             for (line in block.lines) {
                 val box = line.boundingBox ?: continue
                 val cleanWords = line.elements
-                    .filter { el ->
-                        val conf = el.confidence
-                        conf == null || conf == 0f || conf >= 0.40f
-                    }
-                    .map { sanitizeOcrToken(it.text) }
-                    .filter { it.isNotBlank() }
+                    .filter { it.confidence == null || it.confidence == 0f || it.confidence >= 0.38f }
+                    .map { sanitizeToken(it.text) }
+                    .filter { it.isNotEmpty() }
 
-                val joinedLine = cleanWords.joinToString(" ").trim()
-                if (joinedLine.length >= 2 && joinedLine.any { it.isLetterOrDigit() }) {
+                val joined = cleanWords.joinToString(" ").trim()
+                if (joined.length >= 2 && joined.any { it.isLetterOrDigit() }) {
                     rawLines.add(
                         SpatialLine(
-                            text = joinedLine,
+                            text = joined,
                             box = box,
                             centerY = box.centerY(),
                             centerX = box.centerX(),
-                            height = box.height().coerceAtLeast(12)
+                            height = box.height().coerceAtLeast(10),
+                            width = box.width().coerceAtLeast(10)
                         )
                     )
                 }
             }
         }
 
-        if (rawLines.isEmpty()) return Pair("", null)
+        if (rawLines.isEmpty()) return Pair("", emptyList())
 
         val sortedByY = rawLines.sortedBy { it.centerY }
+        val medianHeight = sortedByY.map { it.height }.sorted()[sortedByY.size / 2].coerceAtLeast(12)
 
-        // Detect tagless stacked name directly above a standalone 6-to-12 digit ID number
-        var badgeNameCandidate: String? = null
-        val standaloneIdRegex = Regex("^[0-9]{6,12}$")
+        // 1. Detect Tagless Stacked Name directly above or below a standalone 6-to-12 digit ID number
+        val standaloneIdRegex = Regex("^[A-Z0-9]{6,12}$")
         for (i in sortedByY.indices) {
-            val current = sortedByY[i]
-            if (standaloneIdRegex.matches(current.text.replace(" ", ""))) {
+            val curText = sortedByY[i].text.replace(" ", "")
+            if (standaloneIdRegex.matches(curText) && curText.count { it.isDigit() } >= 6) {
+                hints.add("SPATIAL_ID_CANDIDATE : $curText")
                 val above1 = sortedByY.getOrNull(i - 1)
                 val above2 = sortedByY.getOrNull(i - 2)
-                if (above1 != null && isCleanAlphaNameLine(above1.text)) {
-                    badgeNameCandidate = if (above2 != null &&
-                        isCleanAlphaNameLine(above2.text) &&
-                        abs(above2.height - above1.height) <= (max(above1.height, above2.height) * 0.45).toInt()
+                if (above1 != null && isPotentialNameLine(above1.text)) {
+                    val stackedName = if (above2 != null &&
+                        isPotentialNameLine(above2.text) &&
+                        abs(above2.centerX - above1.centerX) <= max(above1.width, above2.width) &&
+                        (above1.box.top - above2.box.bottom) <= above1.height * 2
                     ) {
                         "${above2.text} ${above1.text}"
                     } else {
                         above1.text
                     }
-                    break
+                    hints.add("SPATIAL_BADGE_NAME : $stackedName")
                 }
             }
         }
 
-        val mergedRows = mutableListOf<MutableList<SpatialLine>>()
-        for (line in sortedByY) {
-            val matchingRow = mergedRows.lastOrNull { row ->
-                val rowAvgY = row.map { it.centerY }.average().toInt()
-                val rowAvgH = row.map { it.height }.average().toInt()
-                abs(line.centerY - rowAvgY) <= (rowAvgH * 0.55).toInt()
+        // 2. Detect Prominent Font-Height Name Lines (Large typography on front of ID cards)
+        val prominentLines = sortedByY.filter {
+            it.height >= (medianHeight * 1.15).toInt() && isPotentialNameLine(it.text)
+        }
+        if (prominentLines.isNotEmpty()) {
+            val combinedProminent = mutableListOf<String>()
+            for (p in prominentLines) {
+                if (combinedProminent.size < 2) combinedProminent.add(p.text)
             }
-            if (matchingRow != null) {
-                matchingRow.add(line)
+            if (combinedProminent.isNotEmpty()) {
+                hints.add("SPATIAL_PROMINENT_NAME : ${combinedProminent.joinToString(" ")}")
+            }
+        }
+
+        // 3. Reconstruct Horizontal Rows (Left Label -> Right Value on same Y line)
+        val rows = mutableListOf<MutableList<SpatialLine>>()
+        for (l in sortedByY) {
+            val existingRow = rows.lastOrNull { r ->
+                val avgY = r.map { it.centerY }.average().toInt()
+                val avgH = r.map { it.height }.average().toInt()
+                abs(l.centerY - avgY) <= (avgH * 0.55).toInt()
+            }
+            if (existingRow != null) existingRow.add(l) else rows.add(mutableListOf(l))
+        }
+
+        val reconstructedLines = rows.map { r ->
+            val sortedRow = r.sortedBy { it.box.left }
+            if (sortedRow.size == 2 && !sortedRow[0].text.contains(":") && !sortedRow[1].text.contains(":")) {
+                "${sortedRow[0].text} : ${sortedRow[1].text}"
             } else {
-                mergedRows.add(mutableListOf(line))
+                sortedRow.joinToString("   ") { it.text }
             }
         }
 
-        val horizontalRows = mergedRows.map { row ->
-            row.sortedBy { it.box.left }.joinToString("   ") { it.text }
-        }
-
-        val textOutput = horizontalRows.joinToString("\n").trim()
-        return Pair(textOutput, badgeNameCandidate)
+        return Pair(reconstructedLines.joinToString("\n"), hints)
     }
 
-    private fun isCleanAlphaNameLine(text: String): Boolean {
-        val trimmed = text.trim()
-        if (trimmed.length !in 3..32) return false
-        if (!Regex("^[A-Za-z.\\s]+$").matches(trimmed)) return false
-        val upper = trimmed.uppercase()
+    private fun isPotentialNameLine(text: String): Boolean {
+        val t = text.trim()
+        if (t.length !in 3..35 || t.contains(":") || !Regex("^[A-Za-z.\\s]+$").matches(t)) return false
         val blocked = setOf(
-            "JIO", "RELIANCE", "SIGNATURE", "AUTHORITY", "ISSUING", "HOLDER",
-            "INDIA", "GOVT", "LIMITED", "LTD", "CORP", "PARK", "ROAD", "MUMBAI"
+            "JIO", "RELIANCE", "SIGNATURE", "AUTHORITY", "ISSUING", "HOLDER", "INDIA",
+            "GOVT", "GOVERNMENT", "LIMITED", "LTD", "PVT", "CORP", "CORPORATE", "PARK",
+            "ROAD", "MUMBAI", "THANE", "BELAPUR", "INCOME", "TAX", "DEPARTMENT", "CARD",
+            "UNIQUE", "IDENTIFICATION", "ELECTION", "COMMISSION", "DRIVING", "LICENCE",
+            "PASSPORT", "REPUBLIC", "PASSBOOK", "BANK", "CENTRAL", "CELL", "DUTY", "LOSS"
         )
-        return upper.split("\\s+".toRegex()).none { it in blocked }
+        val words = t.uppercase().replace(".", "").split("\\s+".toRegex()).filter { it.isNotEmpty() }
+        if (words.isEmpty() || words.size > 4) return false
+        return words.none { it in blocked }
     }
 
-    private fun sanitizeOcrToken(token: String): String {
-        val stripped = token
-            .replace(Regex("[^\\x20-\\x7E]"), "")
+    private fun sanitizeToken(token: String): String {
+        val s = token.replace(Regex("[^\\x20-\\x7E]"), "")
             .replace(Regex("[|~^`•§¤«»©®™]"), "")
             .trim()
-        if (stripped.length == 1 && !stripped[0].isLetterOrDigit()) return ""
-        return stripped
+        return if (s.length == 1 && !s[0].isLetterOrDigit()) "" else s
     }
 
-    private fun decodeGovernmentQrPayload(rawQr: String): String {
-        val lines = mutableListOf<String>()
-        Regex("name\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
-            lines.add("QR_NAME : ${it.groupValues[1].trim()}")
+    private fun decodeQrPayload(raw: String): String {
+        val out = mutableListOf<String>()
+        Regex("name\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(raw)?.let {
+            out.add("QR_NAME : ${it.groupValues[1].trim()}")
         }
-        Regex("(?:dob|yob)\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
-            lines.add("QR_DOB : ${it.groupValues[1].trim()}")
+        Regex("(?:dob|yob)\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(raw)?.let {
+            out.add("QR_DOB : ${it.groupValues[1].trim()}")
         }
-        Regex("uid\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(rawQr)?.let {
-            val digits = it.groupValues[1].filter { c -> c.isDigit() }
-            if (digits.length >= 4) {
-                lines.add("QR_UID_LAST4 : ${digits.takeLast(4)}")
-            }
+        Regex("uid\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(raw)?.let {
+            val d = it.groupValues[1].filter { c -> c.isDigit() }
+            if (d.length >= 4) out.add("QR_UID_LAST4 : ${d.takeLast(4)}")
         }
-        if (lines.isEmpty()) {
-            lines.add(rawQr)
-        }
-        return lines.joinToString("\n")
+        return if (out.isEmpty()) raw else out.joinToString("\n")
     }
 
-    private fun evaluateBlurAndGlare(bitmap: Bitmap): String {
-        val scaled = Bitmap.createScaledBitmap(bitmap, 160, 160, true)
-        val w = scaled.width
-        val h = scaled.height
-        val pixels = IntArray(w * h)
-        scaled.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        val luma = IntArray(w * h)
-        var glarePixels = 0
-        for (i in pixels.indices) {
-            val p = pixels[i]
-            val r = (p shr 16) and 0xFF
-            val g = (p shr 8) and 0xFF
-            val b = p and 0xFF
-            val y = (r * 299 + g * 587 + b * 114) / 1000
-            luma[i] = y
-            if (y >= 248) glarePixels++
-        }
-
-        var laplacianSum = 0.0
-        var count = 0
-        for (y in 1 until h - 1) {
-            for (x in 1 until w - 1) {
-                val idx = y * w + x
-                val lap = -4 * luma[idx] + luma[idx - 1] + luma[idx + 1] + luma[idx - w] + luma[idx + w]
-                laplacianSum += (lap * lap).toDouble()
-                count++
-            }
-        }
-
-        val sharpnessScore = (laplacianSum / count.coerceAtLeast(1)).toInt()
-        val glarePct = (glarePixels * 100.0) / pixels.size.coerceAtLeast(1)
-        val focusLabel = if (sharpnessScore >= 180) "Sharp" else "Soft"
-        val glareLabel = if (glarePct < 12.0) "Low Glare" else "Glare(${"%.0f".format(glarePct)}%)"
-        return "$focusLabel/$glareLabel"
-    }
+    fun formatVoiceTranscriptForParser(spokenText: String): String = spokenText.trim()
 
     private suspend fun <T> Task<T>.awaitTask(): T = suspendCancellableCoroutine { cont ->
-        addOnSuccessListener { result -> if (cont.isActive) cont.resume(result) }
-        addOnFailureListener { exc -> if (cont.isActive) cont.resumeWithException(exc) }
+        addOnSuccessListener { if (cont.isActive) cont.resume(it) }
+        addOnFailureListener { if (cont.isActive) cont.resumeWithException(it) }
         addOnCanceledListener { if (cont.isActive) cont.cancel() }
     }
 }
